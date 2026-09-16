@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Heart, Skull, Trophy, Clock, ChevronRight, Volume2, VolumeX } from "lucide-react";
+import { Heart, Skull, Trophy, Clock, ChevronRight, Volume2, VolumeX, LogOut } from "lucide-react";
 import type { GameEngine, HUDData, MatchStats } from "@/game/engine/GameEngine";
 import type { TouchController } from "@/game/input/InputController";
 import { TouchControlsOverlay } from "@/components/game/TouchControlsOverlay";
@@ -20,12 +20,14 @@ function HUD({
   isMuted,
   onToggleMute,
   onTriggerAbility,
+  onLeaveMatch,
 }: {
   data: HUDData;
   characterColor: string;
   isMuted: boolean;
   onToggleMute: () => void;
   onTriggerAbility?: (action: "attack" | "ability1" | "ability2" | "ultimate") => void;
+  onLeaveMatch?: () => void;
 }) {
   const { localPlayer, timeRemaining, killFeed } = data;
   const hpPct = (localPlayer.health / localPlayer.maxHealth) * 100;
@@ -77,6 +79,18 @@ function HUD({
             aria-label={isMuted ? "Unmute Audio" : "Mute Audio"}
           >
             {isMuted ? <VolumeX size={18} /> : <Volume2 size={18} className="text-neon-cyan" />}
+          </button>
+
+          {/* Leave / Exit Arena Button */}
+          <button
+            type="button"
+            onClick={onLeaveMatch}
+            className="glass rounded-xl px-3 py-3 border border-red-500/40 hover:border-red-500 hover:bg-red-500/15 transition-all pointer-events-auto text-red-400 hover:text-red-300 flex items-center gap-1.5 active:scale-95 shadow-lg group"
+            title="Leave Match"
+            aria-label="Leave Match"
+          >
+            <LogOut size={18} className="transition-transform group-hover:-translate-x-0.5" />
+            <span className="text-xs font-bold font-display uppercase tracking-wider hidden sm:inline">EXIT</span>
           </button>
         </div>
 
@@ -422,7 +436,7 @@ function GamePageContent() {
       });
 
       if (mode === "PRIVATE_ROOM" && roomCode) {
-        // High-frequency multiplayer state sync for up to 20 players
+        // High-frequency multiplayer state sync for up to 20 players (55ms interval)
         let isSyncing = false;
         syncInterval = setInterval(async () => {
           if (isSyncing) return;
@@ -432,6 +446,7 @@ function GamePageContent() {
             if (!localState) return;
 
             const damageEvents = engine.getAndClearPendingDamageEvents();
+            const projectiles = engine.getAndClearPendingProjectiles();
 
             const res = await fetch(`/api/rooms/${roomCode}/sync`, {
               method: "POST",
@@ -445,11 +460,18 @@ function GamePageContent() {
                   characterSlug: cleanCharacterSlug,
                 },
                 damageEvents,
+                projectiles,
               }),
             });
 
             if (res.ok) {
               const data = await res.json();
+
+              // Spawn incoming projectiles fired by other players in real-time!
+              const incomingProj = data.incomingProjectiles || data.data?.incomingProjectiles;
+              if (Array.isArray(incomingProj) && incomingProj.length > 0) {
+                engine.spawnRemoteProjectiles(incomingProj);
+              }
 
               // Apply authoritative incoming damage inflicted by other players
               const incoming = data.incomingDamage || data.data?.incomingDamage;
@@ -476,7 +498,7 @@ function GamePageContent() {
           } finally {
             isSyncing = false;
           }
-        }, 85);
+        }, 55);
       } else {
         // Add AI bot for practice/quick match only
         import("@/game/ai/BotAI").then(() => {
@@ -495,6 +517,11 @@ function GamePageContent() {
       window.removeEventListener("resize", resize);
     };
   }, [userId, username, cleanCharacterSlug, arenaId, mode, roomCode, handleMatchEnd]);
+
+  const handleLeaveMatch = useCallback(() => {
+    engineRef.current?.destroy();
+    router.push("/play");
+  }, [router]);
 
   function handlePlayAgain() {
     router.push("/play");
@@ -565,6 +592,7 @@ function GamePageContent() {
           isMuted={isMuted}
           onToggleMute={handleToggleMute}
           onTriggerAbility={(action) => engineRef.current?.triggerAbility(action)}
+          onLeaveMatch={handleLeaveMatch}
         />
       )}
 

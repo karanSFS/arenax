@@ -201,9 +201,26 @@ export class Player {
   }
 
   updateRemote(dt: number) {
-    // Smooth interpolation for remote players
-    this.x += (this.targetX - this.x) * this.lerpFactor;
-    this.y += (this.targetY - this.y) * this.lerpFactor;
+    // 1. Dead reckoning prediction: extrapolate target position based on remote velocity
+    this.targetX += this.vx * dt;
+    this.targetY += this.vy * dt;
+
+    // 2. Smooth continuous glide towards predicted target position (exponential decay)
+    const smoothFactor = Math.min(1, dt * 16);
+    this.x += (this.targetX - this.x) * smoothFactor;
+    this.y += (this.targetY - this.y) * smoothFactor;
+
+    // 3. Update animation state & walking cycle for remote fighter
+    const speed = Math.hypot(this.vx, this.vy);
+    if (this.hitFlash > 0.5) {
+      this.animState = "hit";
+    } else if (speed > 15) {
+      this.animState = "move";
+    } else {
+      this.animState = "idle";
+    }
+    this.animTimer += dt;
+
     this.primaryCooldown = Math.max(0, this.primaryCooldown - dt);
     this.secondaryCooldown = Math.max(0, this.secondaryCooldown - dt);
     this.tacticalCooldown = Math.max(0, this.tacticalCooldown - dt);
@@ -236,8 +253,16 @@ export class Player {
     deaths?: number;
     isAlive?: boolean;
   }) {
-    if (data.x !== undefined) this.targetX = data.x;
-    if (data.y !== undefined) this.targetY = data.y;
+    if (data.x !== undefined && data.y !== undefined) {
+      const dist = Math.hypot(data.x - this.x, data.y - this.y);
+      // Snap instantly if initial spawn or large teleport/respawn (> 280px)
+      if (dist > 280 || (this.x === 0 && this.y === 0)) {
+        this.x = data.x;
+        this.y = data.y;
+      }
+      this.targetX = data.x;
+      this.targetY = data.y;
+    }
     if (data.vx !== undefined) this.vx = data.vx;
     if (data.vy !== undefined) this.vy = data.vy;
     if (data.facing !== undefined) this.facing = data.facing;

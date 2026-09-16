@@ -166,8 +166,9 @@ export function formatNumber(n: number): string {
  * Format duration in seconds to MM:SS.
  */
 export function formatDuration(seconds: number): string {
-  const m = Math.floor(seconds / 60);
-  const s = seconds % 60;
+  const totalSeconds = Math.max(0, Math.floor(seconds));
+  const m = Math.floor(totalSeconds / 60);
+  const s = totalSeconds % 60;
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 

@@ -99,6 +99,12 @@ export class GameEngine {
   private damageNumbers: DamageNumber[] = [];
   private killFeed: KillFeed[] = [];
 
+  // Multiplayer real-time sync queues
+  private pendingProjectilesToSync: Array<any> = [];
+  private seenRemoteProjectileIds: Set<string> = new Set();
+  private lastRemoteActionTimestamps: Map<string, number> = new Map();
+  private pendingLocalAction: any = null;
+
   // RAF handle
   private rafHandle = 0;
   private lastTime = 0;
@@ -187,10 +193,61 @@ export class GameEngine {
       return;
     }
     player.setRemoteState(data);
+
+    // Trigger visual effects and audio if the remote player performed an ability
+    if (data.action && data.action.timestamp) {
+      const lastTs = this.lastRemoteActionTimestamps.get(id) || 0;
+      if (data.action.timestamp > lastTs) {
+        this.lastRemoteActionTimestamps.set(id, data.action.timestamp);
+        if (data.action.type === "dash") {
+          this.particles.explosion(player.x, player.y, player.accentColor, 14);
+          soundManager.playDash();
+        } else if (data.action.type === "shield") {
+          soundManager.playShield();
+        } else if (data.action.type === "ultimate" || data.action.type === "aoe") {
+          const ax = data.action.x || player.x;
+          const ay = data.action.y || player.y;
+          this.particles.explosion(ax, ay, player.accentColor, 30);
+          this.screenShake = 0.65;
+          soundManager.playUltimate();
+        }
+      }
+    }
   }
 
   removeRemotePlayer(id: string) {
     this.remotePlayers.delete(id);
+    this.lastRemoteActionTimestamps.delete(id);
+  }
+
+  public spawnRemoteProjectiles(incoming: any[]) {
+    if (!Array.isArray(incoming)) return;
+    for (const p of incoming) {
+      if (!p || !p.id) continue;
+      // Never spawn our own projectiles
+      if (this.localPlayer && (p.ownerId === this.localPlayer.id || p.ownerId === this.localPlayer.userId)) continue;
+      if (this.seenRemoteProjectileIds.has(p.id)) continue;
+      this.seenRemoteProjectileIds.add(p.id);
+
+      // Spawn projectile with remote trajectory
+      this.spawnProjectile(p, true);
+
+      // Trigger audio & muzzle sparks at firing position
+      const owner = this.getPlayerById(p.ownerId) || Array.from(this.remotePlayers.values()).find(rp => rp.userId === p.ownerId || rp.id === p.ownerId);
+      const charSlug = owner?.characterSlug || "volt";
+      soundManager.playAttack(charSlug);
+      this.particles.sparks(p.x, p.y, p.color || "#00f5ff", 6);
+    }
+
+    if (this.seenRemoteProjectileIds.size > 800) {
+      this.seenRemoteProjectileIds.clear();
+    }
+  }
+
+  public getAndClearPendingProjectiles(): any[] {
+    const projs = [...this.pendingProjectilesToSync];
+    this.pendingProjectilesToSync = [];
+    return projs;
   }
 
   triggerRemoteAction(id: string, action: { type: string; data?: any }) {
@@ -212,6 +269,8 @@ export class GameEngine {
 
   getLocalPlayerState() {
     if (!this.localPlayer) return null;
+    const action = this.pendingLocalAction;
+    this.pendingLocalAction = null;
     return {
       userId: this.localPlayer.userId,
       username: this.localPlayer.username,
@@ -227,6 +286,7 @@ export class GameEngine {
       kills: this.localPlayer.kills,
       deaths: this.localPlayer.deaths,
       isAlive: this.localPlayer.isAlive,
+      action,
     };
   }
 
@@ -494,9 +554,11 @@ export class GameEngine {
         this.localPlayer.vy += result.dash.dy;
         this.particles.explosion(this.localPlayer.x, this.localPlayer.y, this.localPlayer.accentColor, 12);
         soundManager.playDash();
+        this.pendingLocalAction = { type: "dash", x: this.localPlayer.x, y: this.localPlayer.y, timestamp: Date.now() };
       }
       if (result?.shield) {
         soundManager.playShield();
+        this.pendingLocalAction = { type: "shield", x: this.localPlayer.x, y: this.localPlayer.y, timestamp: Date.now() };
       }
     }
 
@@ -516,6 +578,7 @@ export class GameEngine {
         this.screenShake = 0.45;
         this.particles.explosion(result.aoe.x, result.aoe.y, this.localPlayer.accentColor, 18);
         soundManager.playDash();
+        this.pendingLocalAction = { type: "aoe", x: result.aoe.x, y: result.aoe.y, radius: result.aoe.radius, timestamp: Date.now() };
       }
     }
 
@@ -533,6 +596,7 @@ export class GameEngine {
         this.screenShake = 0.85;
         this.particles.explosion(result.aoe.x, result.aoe.y, this.localPlayer.accentColor, 32);
         soundManager.playUltimate();
+        this.pendingLocalAction = { type: "ultimate", x: result.aoe.x, y: result.aoe.y, radius: result.aoe.radius, timestamp: Date.now() };
       }
     }
   }
@@ -591,9 +655,16 @@ export class GameEngine {
     }
   }
 
-  private spawnProjectile(proj: Omit<ProjectileData, "id">) {
-    const id = `proj-${++this.projectileIdCounter}`;
-    this.projectiles.set(id, { ...proj, id });
+  private spawnProjectile(proj: Omit<ProjectileData, "id"> & { id?: string }, isFromRemote = false): string {
+    const id = proj.id || `proj-${++this.projectileIdCounter}-${Date.now()}`;
+    const fullProj = { ...proj, id };
+    this.projectiles.set(id, fullProj);
+
+    // If fired by local player, enqueue for multiplayer sync!
+    if (!isFromRemote && this.localPlayer && proj.ownerId === this.localPlayer.id) {
+      this.pendingProjectilesToSync.push(fullProj);
+    }
+    return id;
   }
 
   private handleKill(killer: Player, victim: Player) {

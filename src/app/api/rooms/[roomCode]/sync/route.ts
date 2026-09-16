@@ -32,10 +32,15 @@ export interface PlayerSyncPayload {
 declare global {
   // eslint-disable-next-line no-var
   var _arenaxRoomSync: Map<string, Map<string, PlayerSyncPayload>> | undefined;
+  // eslint-disable-next-line no-var
+  var _arenaxRoomProjectiles: Map<string, Array<{ id: string; senderId: string; projectile: any; createdAt: number }>> | undefined;
 }
 
 if (!global._arenaxRoomSync) {
   global._arenaxRoomSync = new Map();
+}
+if (!global._arenaxRoomProjectiles) {
+  global._arenaxRoomProjectiles = new Map();
 }
 
 export async function POST(
@@ -95,6 +100,38 @@ export async function POST(
     const memRoom = memRooms.get(roomCode)!;
     memRoom.set(callerId, playerPayload);
 
+    // 1b. Update in-memory projectiles
+    const newProjectiles = Array.isArray(body.projectiles) ? body.projectiles : [];
+    const memProjs = global._arenaxRoomProjectiles!;
+    if (!memProjs.has(roomCode)) {
+      memProjs.set(roomCode, []);
+    }
+    const roomProjList = memProjs.get(roomCode)!;
+
+    for (const p of newProjectiles) {
+      if (p && typeof p.x === "number" && typeof p.vx === "number") {
+        roomProjList.push({
+          id: p.id || `p_${callerId}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          senderId: callerId,
+          projectile: p,
+          createdAt: now,
+        });
+      }
+    }
+
+    // Keep only fresh projectiles from last 2000ms
+    const freshProjs = roomProjList.filter((p) => now - p.createdAt < 2000);
+    memProjs.set(roomCode, freshProjs);
+
+    // Incoming projectiles for this caller (from other players)
+    const incomingProjectiles: any[] = freshProjs
+      .filter((p) => p.senderId !== callerId)
+      .map((p) => ({
+        ...p.projectile,
+        id: p.id,
+        ownerId: p.senderId,
+      }));
+
     // 2. Persist to MongoDB room_states so all Vercel serverless lambdas share real-time state
     try {
       await connectDB();
@@ -143,6 +180,41 @@ export async function POST(
             damage: d.damage,
             attackerId: d.attackerId,
           }));
+        }
+
+        // 2d. Persist new projectiles to MongoDB
+        if (newProjectiles.length > 0) {
+          const pCol = db.collection("room_projectiles");
+          const docs = newProjectiles.map((p: any) => ({
+            roomCode,
+            senderId: callerId,
+            projectile: p,
+            createdAt: new Date(),
+          }));
+          await pCol.insertMany(docs);
+        }
+
+        // 2e. Query recent projectiles from DB
+        const pCol = db.collection("room_projectiles");
+        const recentPDocs = await pCol
+          .find({
+            roomCode,
+            senderId: { $ne: callerId },
+            createdAt: { $gt: new Date(now - 2000) },
+          })
+          .toArray();
+
+        for (const doc of recentPDocs) {
+          if (doc.projectile) {
+            const pId = doc.projectile.id || String(doc._id);
+            if (!incomingProjectiles.some((ip) => ip.id === pId)) {
+              incomingProjectiles.push({
+                ...doc.projectile,
+                id: pId,
+                ownerId: doc.senderId,
+              });
+            }
+          }
         }
 
         // Fetch all active players in this room updated within last 5 seconds
@@ -200,10 +272,12 @@ export async function POST(
       success: true,
       players: otherPlayers,
       incomingDamage,
+      incomingProjectiles,
       data: {
         timestamp: now,
         players: otherPlayers,
         incomingDamage,
+        incomingProjectiles,
       },
     });
   } catch (err) {
