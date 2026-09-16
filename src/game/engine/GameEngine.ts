@@ -113,6 +113,7 @@ export class GameEngine {
   // Screen size
   private viewW: number;
   private viewH: number;
+  private hudTimer = 0;
 
   constructor(
     canvas: HTMLCanvasElement,
@@ -122,7 +123,7 @@ export class GameEngine {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d")!;
     this.arena = ARENAS[arenaId] || ARENAS.cyber_grid;
-    this.particles = new ParticleSystem(600);
+    this.particles = new ParticleSystem(150);
     this.callbacks = callbacks;
     this.viewW = canvas.width;
     this.viewH = canvas.height;
@@ -496,28 +497,35 @@ export class GameEngine {
     const now = Date.now();
     this.killFeed = this.killFeed.filter((k) => now - k.timestamp < 4000);
 
-    // ── HUD update ────────────────────────────────────────────
-    if (this.localPlayer) {
-      const cds = this.localPlayer.getAbilityCooldowns();
-      this.callbacks.onHUDUpdate?.({
-        localPlayer: {
-          health: this.localPlayer.health,
-          maxHealth: this.localPlayer.maxHealth,
-          kills: this.localPlayer.kills,
-          deaths: this.localPlayer.deaths,
-          score: this.localPlayer.score,
-          abilities: {
-            primary: { cooldown: cds.primary.current, max: cds.primary.max, name: cds.primary.name },
-            secondary: { cooldown: cds.secondary.current, max: cds.secondary.max, name: cds.secondary.name },
-            tactical: { cooldown: cds.tactical.current, max: cds.tactical.max, name: cds.tactical.name },
-            ultimate: { cooldown: cds.ultimate.current, max: cds.ultimate.max, name: cds.ultimate.name },
-          },
-        },
-        timeRemaining: Math.max(0, this.matchTimer),
-        phase: this.phase,
-        killFeed: this.killFeed,
-      });
+    // ── HUD update (Throttled to 10Hz to prevent React Virtual DOM diffing churn) ──
+    this.hudTimer += dt;
+    if (this.hudTimer >= 0.1) {
+      this.hudTimer = 0;
+      this.emitHUDUpdate();
     }
+  }
+
+  public emitHUDUpdate() {
+    if (!this.localPlayer) return;
+    const cds = this.localPlayer.getAbilityCooldowns();
+    this.callbacks.onHUDUpdate?.({
+      localPlayer: {
+        health: this.localPlayer.health,
+        maxHealth: this.localPlayer.maxHealth,
+        kills: this.localPlayer.kills,
+        deaths: this.localPlayer.deaths,
+        score: this.localPlayer.score,
+        abilities: {
+          primary: { cooldown: cds.primary.current, max: cds.primary.max, name: cds.primary.name },
+          secondary: { cooldown: cds.secondary.current, max: cds.secondary.max, name: cds.secondary.name },
+          tactical: { cooldown: cds.tactical.current, max: cds.tactical.max, name: cds.tactical.name },
+          ultimate: { cooldown: cds.ultimate.current, max: cds.ultimate.max, name: cds.ultimate.name },
+        },
+      },
+      timeRemaining: Math.max(0, this.matchTimer),
+      phase: this.phase,
+      killFeed: this.killFeed,
+    });
   }
 
   public triggerAbility(action: "attack" | "ability1" | "ability2" | "ultimate") {
@@ -785,11 +793,11 @@ export class GameEngine {
     ctx.save();
     ctx.translate(-camX, -camY);
 
-    // Grid
-    this.renderGrid(ctx);
+    // Grid (Viewport culled & single stroke batch)
+    this.renderGrid(ctx, camX, camY);
 
-    // Walls
-    this.renderWalls(ctx);
+    // Walls (Viewport culled)
+    this.renderWalls(ctx, camX, camY);
 
     // Bots
     for (const bot of this.bots) {
@@ -806,8 +814,20 @@ export class GameEngine {
       this.renderPlayer(ctx, this.localPlayer);
     }
 
-    // Projectiles with high-energy glowing streak tails
+    // Projectiles with high-energy glowing streak tails (Optimized, no shadowBlur)
+    const viewRight = camX + canvas.width;
+    const viewBottom = camY + canvas.height;
+
     for (const proj of this.projectiles.values()) {
+      if (
+        proj.x < camX - 30 ||
+        proj.x > viewRight + 30 ||
+        proj.y < camY - 30 ||
+        proj.y > viewBottom + 30
+      ) {
+        continue;
+      }
+
       ctx.save();
       const speed = Math.hypot(proj.vx, proj.vy);
       if (speed > 1) {
@@ -825,28 +845,35 @@ export class GameEngine {
         ctx.lineTo(proj.x - nx * tailLength, proj.y - ny * tailLength);
         ctx.stroke();
       }
-      ctx.fillStyle = "#ffffff";
-      ctx.shadowBlur = proj.radius * 3;
-      ctx.shadowColor = proj.color;
+
+      // Outer glow halo
+      ctx.fillStyle = `${proj.color}55`;
       ctx.beginPath();
-      ctx.arc(proj.x, proj.y, proj.radius, 0, Math.PI * 2);
+      ctx.arc(proj.x, proj.y, proj.radius + 2.5, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Bright core
+      ctx.fillStyle = "#ffffff";
+      ctx.beginPath();
+      ctx.arc(proj.x, proj.y, Math.max(1.5, proj.radius * 0.65), 0, Math.PI * 2);
       ctx.fill();
       ctx.restore();
     }
 
-    // Particles
-    this.particles.render(ctx, 0, 0); // already translated
+    // Particles (Rendered with viewport culling, zero shadowBlur)
+    this.particles.render(ctx, 0, 0, canvas.width, canvas.height);
 
-    // Damage numbers
+    // Damage numbers (Crisp stroke outline, no shadowBlur)
     for (const dn of this.damageNumbers) {
       const alpha = dn.life / 0.8;
       ctx.save();
       ctx.globalAlpha = alpha;
-      ctx.fillStyle = dn.color;
-      ctx.shadowBlur = 8;
-      ctx.shadowColor = dn.color;
       ctx.font = `bold ${20 + (1 - alpha) * 8}px 'Orbitron', monospace`;
       ctx.textAlign = "center";
+      ctx.strokeStyle = "rgba(0, 0, 0, 0.8)";
+      ctx.lineWidth = 3;
+      ctx.strokeText(`-${dn.value}`, dn.x, dn.y);
+      ctx.fillStyle = dn.color;
       ctx.fillText(`-${dn.value}`, dn.x, dn.y);
       ctx.restore();
     }
@@ -859,52 +886,64 @@ export class GameEngine {
     }
   }
 
-  private renderGrid(ctx: CanvasRenderingContext2D) {
+  private renderGrid(ctx: CanvasRenderingContext2D, camX: number, camY: number) {
     const gridSize = 40;
     ctx.save();
     ctx.strokeStyle = this.arena.gridColor;
     ctx.lineWidth = 1;
 
-    for (let x = 0; x < this.arena.width; x += gridSize) {
-      ctx.beginPath();
-      ctx.moveTo(x, 0);
-      ctx.lineTo(x, this.arena.height);
-      ctx.stroke();
-    }
-    for (let y = 0; y < this.arena.height; y += gridSize) {
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(this.arena.width, y);
-      ctx.stroke();
-    }
+    // Viewport-culled grid lines: draw ONLY visible lines
+    const startX = Math.max(0, Math.floor(camX / gridSize) * gridSize);
+    const endX = Math.min(this.arena.width, Math.ceil((camX + this.canvas.width) / gridSize) * gridSize);
+    const startY = Math.max(0, Math.floor(camY / gridSize) * gridSize);
+    const endY = Math.min(this.arena.height, Math.ceil((camY + this.canvas.height) / gridSize) * gridSize);
 
-    // Border glow
+    ctx.beginPath();
+    for (let x = startX; x <= endX; x += gridSize) {
+      ctx.moveTo(x, startY);
+      ctx.lineTo(x, endY);
+    }
+    for (let y = startY; y <= endY; y += gridSize) {
+      ctx.moveTo(startX, y);
+      ctx.lineTo(endX, y);
+    }
+    ctx.stroke();
+
+    // Border glow without expensive software convolution
     ctx.strokeStyle = this.arena.accentColor;
     ctx.lineWidth = 3;
-    ctx.shadowBlur = 20;
-    ctx.shadowColor = this.arena.accentColor;
     ctx.strokeRect(2, 2, this.arena.width - 4, this.arena.height - 4);
     ctx.restore();
   }
 
-  private renderWalls(ctx: CanvasRenderingContext2D) {
+  private renderWalls(ctx: CanvasRenderingContext2D, camX: number, camY: number) {
     ctx.save();
+    const viewRight = camX + this.canvas.width;
+    const viewBottom = camY + this.canvas.height;
+
     for (const wall of this.arena.walls) {
+      // Skip walls outside camera viewport
+      if (
+        wall.x + wall.width < camX ||
+        wall.x > viewRight ||
+        wall.y + wall.height < camY ||
+        wall.y > viewBottom
+      ) {
+        continue;
+      }
+
       // Fill
       ctx.fillStyle = "rgba(10, 10, 30, 0.95)";
       ctx.fillRect(wall.x, wall.y, wall.width, wall.height);
 
-      // Border
+      // Crisp neon border (instant GPU draw)
       ctx.strokeStyle = this.arena.accentColor;
       ctx.lineWidth = 2;
-      ctx.shadowBlur = 10;
-      ctx.shadowColor = this.arena.accentColor;
       ctx.strokeRect(wall.x, wall.y, wall.width, wall.height);
 
       // Inner highlight
       ctx.strokeStyle = `${this.arena.accentColor}33`;
       ctx.lineWidth = 1;
-      ctx.shadowBlur = 0;
       ctx.strokeRect(wall.x + 3, wall.y + 3, wall.width - 6, wall.height - 6);
     }
     ctx.restore();
@@ -932,10 +971,8 @@ export class GameEngine {
     if (player.isLocal) {
       const rot = now * 0.0025;
       ctx.save();
-      ctx.strokeStyle = "rgba(0, 245, 255, 0.6)";
+      ctx.strokeStyle = "rgba(0, 245, 255, 0.7)";
       ctx.lineWidth = 1.5;
-      ctx.shadowBlur = 8;
-      ctx.shadowColor = "#00f5ff";
       ctx.beginPath();
       ctx.arc(x, y, radius + 8, rot, rot + Math.PI * 1.4);
       ctx.stroke();
@@ -986,8 +1023,6 @@ export class GameEngine {
         flameGrad.addColorStop(1, "transparent");
 
         ctx.fillStyle = flameGrad;
-        ctx.shadowBlur = 12;
-        ctx.shadowColor = accentColor || "#00f5ff";
         ctx.beginPath();
         ctx.moveTo(flameBaseX - 2, ty - 3.5);
         ctx.lineTo(flameBaseX - flameLen, ty + (Math.random() - 0.5) * 3);
@@ -1009,8 +1044,6 @@ export class GameEngine {
       ctx.fillStyle = "#0f172a";
       ctx.strokeStyle = color;
       ctx.lineWidth = 2;
-      ctx.shadowBlur = 6;
-      ctx.shadowColor = color;
 
       ctx.beginPath();
       ctx.roundRect(-5, py - pauldronH / 2, pauldronW, pauldronH, 4);
@@ -1028,8 +1061,6 @@ export class GameEngine {
     ctx.fillStyle = hitFlash > 0 ? "#ffffff" : "#111827";
     ctx.strokeStyle = hitFlash > 0 ? "#ffffff" : color;
     ctx.lineWidth = 2.5;
-    ctx.shadowBlur = hitFlash > 0 ? 15 : 8;
-    ctx.shadowColor = hitFlash > 0 ? "#ffffff" : color;
 
     // Tactical vest silhouette
     ctx.beginPath();
@@ -1044,8 +1075,6 @@ export class GameEngine {
 
     // Central Core / Emblem
     ctx.fillStyle = accentColor;
-    ctx.shadowBlur = 10;
-    ctx.shadowColor = accentColor;
     ctx.beginPath();
     ctx.arc(0, 0, 4.5, 0, Math.PI * 2);
     ctx.fill();
@@ -1081,8 +1110,6 @@ export class GameEngine {
 
       // Energy capacitor rings
       ctx.fillStyle = "#00f5ff";
-      ctx.shadowBlur = 8;
-      ctx.shadowColor = "#00f5ff";
       ctx.fillRect(16, 4, 3, 6);
       ctx.fillRect(24, 4, 3, 6);
 
@@ -1115,8 +1142,6 @@ export class GameEngine {
     } else if (characterSlug === "phantom") {
       // Dual Stealth Plasma Blades / Silenced Needler
       ctx.fillStyle = "#9333ea";
-      ctx.shadowBlur = 10;
-      ctx.shadowColor = "#bf5fff";
       ctx.beginPath();
       ctx.moveTo(8, -8);
       ctx.lineTo(24, -12);
@@ -1140,8 +1165,6 @@ export class GameEngine {
 
       // Heat vent glowing orange
       ctx.fillStyle = "#ff2d00";
-      ctx.shadowBlur = 8;
-      ctx.shadowColor = "#ff2d00";
       ctx.fillRect(14, 6.5, 7, 2.5);
 
       if (player.isLocal) {
@@ -1162,8 +1185,6 @@ export class GameEngine {
       const muzzleX = characterSlug === "volt" ? 34 : 26;
       const muzzleY = 7;
       ctx.fillStyle = "#ffffff";
-      ctx.shadowBlur = 16;
-      ctx.shadowColor = accentColor || "#ffffff";
       ctx.beginPath();
       ctx.arc(muzzleX, muzzleY, 4, 0, Math.PI * 2);
       ctx.fill();
@@ -1187,8 +1208,6 @@ export class GameEngine {
     ctx.fillStyle = hitFlash > 0 ? "#ffffff" : "#0f172a";
     ctx.strokeStyle = "#334155";
     ctx.lineWidth = 1.5;
-    ctx.shadowBlur = 6;
-    ctx.shadowColor = "#000000";
     ctx.beginPath();
     ctx.arc(-1, 0, radius * 0.46, 0, Math.PI * 2);
     ctx.fill();
@@ -1201,8 +1220,6 @@ export class GameEngine {
     visorGrad.addColorStop(1, color || "#0080ff");
 
     ctx.fillStyle = visorGrad;
-    ctx.shadowBlur = 12;
-    ctx.shadowColor = accentColor || "#00f5ff";
     ctx.beginPath();
     ctx.arc(1, 0, radius * 0.42, -Math.PI * 0.38, Math.PI * 0.38);
     ctx.lineTo(4, 0);
@@ -1222,8 +1239,6 @@ export class GameEngine {
       ctx.save();
       ctx.strokeStyle = "#39ff14";
       ctx.lineWidth = 2;
-      ctx.shadowBlur = 14;
-      ctx.shadowColor = "#39ff14";
       ctx.fillStyle = "rgba(57, 255, 20, 0.12)";
       ctx.beginPath();
       for (let a = 0; a < 6; a++) {
@@ -1257,10 +1272,7 @@ export class GameEngine {
     // Health bar fill
     const hpColor = player.healthPercent > 0.5 ? "#39ff14" : player.healthPercent > 0.25 ? "#ffd700" : "#ff2d78";
     ctx.fillStyle = hpColor;
-    ctx.shadowBlur = 4;
-    ctx.shadowColor = hpColor;
     ctx.fillRect(barX, barY, Math.max(0, barW * player.healthPercent), barH);
-    ctx.shadowBlur = 0;
 
     // Player Name & Role Badge
     ctx.save();
@@ -1269,13 +1281,9 @@ export class GameEngine {
 
     if (player.isLocal) {
       ctx.fillStyle = "#00f5ff";
-      ctx.shadowBlur = 6;
-      ctx.shadowColor = "#00f5ff";
       ctx.fillText(`[YOU] ${player.username}`, x, barY - 5);
     } else {
       ctx.fillStyle = "#e2e8f0";
-      ctx.shadowBlur = 4;
-      ctx.shadowColor = "#000000";
       const roleTag = characterSlug ? `[${characterSlug.toUpperCase()}] ` : "";
       ctx.fillText(`${roleTag}${player.username}`, x, barY - 5);
     }
@@ -1298,8 +1306,6 @@ export class GameEngine {
       ctx.scale(scale, scale);
 
       ctx.fillStyle = "#00f5ff";
-      ctx.shadowBlur = 60;
-      ctx.shadowColor = "#00f5ff";
       ctx.font = `bold ${150}px 'Orbitron', monospace`;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
@@ -1308,8 +1314,6 @@ export class GameEngine {
       ctx.restore();
     } else {
       ctx.fillStyle = "#ff2d78";
-      ctx.shadowBlur = 40;
-      ctx.shadowColor = "#ff2d78";
       ctx.font = `bold 100px 'Orbitron', monospace`;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
@@ -1339,6 +1343,7 @@ export class GameEngine {
     this.screenShake = 0.4;
     this.particles.hit(this.localPlayer.x, this.localPlayer.y, "#ff2d78", 12);
     this.addDamageNumber(this.localPlayer.x, this.localPlayer.y - 20, damage, "#ff2d78");
+    this.emitHUDUpdate();
   }
 
   destroy() {

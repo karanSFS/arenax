@@ -498,7 +498,7 @@ function GamePageContent() {
           } finally {
             isSyncing = false;
           }
-        }, 55);
+        }, 80);
       } else {
         // Add AI bot for practice/quick match only
         import("@/game/ai/BotAI").then(() => {
