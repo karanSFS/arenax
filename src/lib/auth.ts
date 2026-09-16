@@ -8,7 +8,8 @@ import PlayerStats from "@/models/PlayerStats";
 import { Inventory, Leaderboard, PlayerSettings } from "@/models/index";
 
 export const { handlers, signIn, signOut, auth } = NextAuth({
-  secret: process.env.AUTH_SECRET,
+  secret: process.env.AUTH_SECRET || process.env.NEXTAUTH_SECRET || "arenax-jwt-secret-key-production-2026",
+  trustHost: true,
   session: { strategy: "jwt", maxAge: 30 * 24 * 60 * 60 },
   pages: {
     signIn: "/login",
