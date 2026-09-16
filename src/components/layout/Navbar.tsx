@@ -16,7 +16,7 @@ const navLinks = [
   { href: "/play", label: "Play", icon: Swords },
   { href: "/leaderboard", label: "Leaderboard", icon: Trophy },
   { href: "/matches", label: "Matches", icon: History },
-];
+]; 
 
 export function Navbar() {
   const { data: session } = useSession();
