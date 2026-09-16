@@ -8,6 +8,7 @@ import { Bot, BotDifficulty } from "@/game/ai/BotAI";
 import { ParticleSystem } from "@/game/particles/ParticleSystem";
 import { KeyboardController, TouchController, InputState } from "@/game/input/InputController";
 import { ARENAS, ArenaConfig } from "@/game/maps/Arena";
+import { soundManager } from "@/game/audio/SoundManager";
 
 export type GamePhase = "countdown" | "playing" | "finished";
 
@@ -81,6 +82,7 @@ export class GameEngine {
   // Game state
   private phase: GamePhase = "countdown";
   private countdownTimer = 3;
+  private lastCountdownSecond = 4;
   private matchTimer = 180; // 3 minutes
   private startTime = 0;
   private projectileIdCounter = 0;
@@ -129,10 +131,10 @@ export class GameEngine {
 
   // ─── Setup ─────────────────────────────────────────────────────────────────
 
-  setupLocalPlayer(userId: string, username: string, characterSlug: string) {
-    const spawn = this.arena.spawnPoints[0];
+  setupLocalPlayer(userId: string, username: string, characterSlug: string, spawnIndex: number = 0) {
+    const spawn = this.arena.spawnPoints[spawnIndex % this.arena.spawnPoints.length];
     this.localPlayer = new Player(
-      { id: "local", userId, username, characterSlug, isLocal: true },
+      { id: userId, userId, username, characterSlug, isLocal: true },
       spawn.x,
       spawn.y
     );
@@ -156,18 +158,26 @@ export class GameEngine {
   }
 
   addRemotePlayer(id: string, userId: string, username: string, characterSlug: string, x?: number, y?: number) {
-    if (this.remotePlayers.has(id) || (this.localPlayer && this.localPlayer.id === id)) return;
+    if (
+      this.remotePlayers.has(id) ||
+      (this.localPlayer && (this.localPlayer.id === id || this.localPlayer.userId === userId))
+    ) {
+      return;
+    }
     const spawnIdx = (this.remotePlayers.size + 1) % this.arena.spawnPoints.length;
     const spawn = this.arena.spawnPoints[spawnIdx];
     const player = new Player(
       { id, userId, username, characterSlug, isLocal: false },
-      x !== undefined ? x : spawn.x,
-      y !== undefined ? y : spawn.y
+      x !== undefined && x > 0 ? x : spawn.x,
+      y !== undefined && y > 0 ? y : spawn.y
     );
     this.remotePlayers.set(id, player);
   }
 
   updateRemotePlayer(id: string, data: any) {
+    if (this.localPlayer && (this.localPlayer.id === id || this.localPlayer.userId === data.userId)) {
+      return;
+    }
     const player = this.remotePlayers.get(id);
     if (!player) {
       if (data.userId && data.username && data.characterSlug) {
@@ -244,9 +254,17 @@ export class GameEngine {
     // ── Countdown ────────────────────────────────────────────
     if (this.phase === "countdown") {
       this.countdownTimer -= dt;
+      const currentSec = Math.ceil(this.countdownTimer);
+      if (currentSec < this.lastCountdownSecond) {
+        this.lastCountdownSecond = currentSec;
+        if (currentSec > 0) {
+          soundManager.playCountdownTick(currentSec);
+        }
+      }
       if (this.countdownTimer <= 0) {
         this.phase = "playing";
         this.matchTimer = 180;
+        soundManager.playBattleStart();
       }
       return; // Don't update gameplay during countdown
     }
@@ -347,8 +365,12 @@ export class GameEngine {
         continue;
       }
 
-      // Player collision
-      const targets = this.localPlayer ? [this.localPlayer, ...this.bots] : [...this.bots];
+      // Player collision (Include local, bots, AND remote players)
+      const targets = [
+        ...(this.localPlayer ? [this.localPlayer] : []),
+        ...this.bots,
+        ...Array.from(this.remotePlayers.values()),
+      ];
       for (const target of targets) {
         if (target.id === proj.ownerId || !target.isAlive) continue;
         const dist = Math.hypot(target.x - proj.x, target.y - proj.y);
@@ -360,6 +382,10 @@ export class GameEngine {
             this.addDamageNumber(proj.x, proj.y, dmg, proj.color);
             this.particles.hit(proj.x, proj.y, proj.color, 10);
             this.screenShake = 0.3;
+
+            if (target.isLocal || owner.isLocal) {
+              soundManager.playHit();
+            }
 
             if (!target.isAlive) {
               this.handleKill(owner, target);
@@ -431,34 +457,45 @@ export class GameEngine {
       const result = this.localPlayer.activatePrimary();
       if (result?.projectile) {
         this.spawnProjectile(result.projectile);
+        soundManager.playAttack(this.localPlayer.characterSlug);
       } else if (result?.damage) {
         this.processMelee(this.localPlayer, result.damage);
+        soundManager.playAttack(this.localPlayer.characterSlug);
       }
     }
 
-    // Ability Q
+    // Ability Q (Dash / Secondary)
     if (input.ability1) {
       const result = this.localPlayer.activateSecondary();
-      if (result?.projectile) this.spawnProjectile(result.projectile);
+      if (result?.projectile) {
+        this.spawnProjectile(result.projectile);
+        soundManager.playAttack(this.localPlayer.characterSlug);
+      }
       if (result?.dash) {
         this.localPlayer.vx += result.dash.dx;
         this.localPlayer.vy += result.dash.dy;
         this.particles.explosion(this.localPlayer.x, this.localPlayer.y, this.localPlayer.accentColor, 12);
+        soundManager.playDash();
+      }
+      if (result?.shield) {
+        soundManager.playShield();
       }
     }
 
-    // Ability E
+    // Ability E (Ultimate)
     if (input.ability2) {
       const result = this.localPlayer.activateUltimate();
       if (result?.projectile) {
         this.spawnProjectile(result.projectile);
         this.screenShake = 0.5;
         this.particles.explosion(this.localPlayer.x, this.localPlayer.y, this.localPlayer.accentColor, 20);
+        soundManager.playUltimate();
       }
       if (result?.aoe) {
         this.processAOE(this.localPlayer, result.aoe.x, result.aoe.y, result.aoe.radius, result.aoe.damage);
         this.screenShake = 0.8;
         this.particles.explosion(result.aoe.x, result.aoe.y, this.localPlayer.accentColor, 30);
+        soundManager.playUltimate();
       }
     }
   }
@@ -516,6 +553,13 @@ export class GameEngine {
     this.particles.death(victim.x, victim.y, victim.color);
     this.screenShake = 0.6;
 
+    if (killer.isLocal) {
+      soundManager.playKill();
+    }
+    if (victim.isLocal) {
+      soundManager.playDeath();
+    }
+
     this.killFeed.unshift({
       killer: killer.username,
       victim: victim.username,
@@ -526,11 +570,14 @@ export class GameEngine {
     this.callbacks.onKill?.(killer, victim);
     this.callbacks.onDeath?.(victim);
 
-    // Check if match should end (first to 10 kills in non-timed mode, or based on config)
-    const allPlayers = this.localPlayer ? [this.localPlayer, ...this.bots] : [...this.bots];
+    // Check if match should end
+    const allPlayers = [
+      ...(this.localPlayer ? [this.localPlayer] : []),
+      ...this.bots,
+      ...Array.from(this.remotePlayers.values()),
+    ];
     const maxKills = allPlayers.reduce((m, p) => Math.max(m, p.kills), 0);
     if (maxKills >= 5) {
-      // 5 kills wins for practice
       const winner = allPlayers.find((p) => p.kills >= 5);
       if (winner) setTimeout(() => this.endMatch(winner), 1000);
     }
@@ -568,10 +615,13 @@ export class GameEngine {
   }
 
   private getPlayerById(id: string): Player | undefined {
-    if (this.localPlayer?.id === id) return this.localPlayer;
+    if (this.localPlayer?.id === id || this.localPlayer?.userId === id) return this.localPlayer;
     const remote = this.remotePlayers.get(id);
     if (remote) return remote;
-    return this.bots.find((b) => b.id === id);
+    for (const rp of this.remotePlayers.values()) {
+      if (rp.userId === id) return rp;
+    }
+    return this.bots.find((b) => b.id === id || b.userId === id);
   }
 
   private updateCamera(instant: boolean) {

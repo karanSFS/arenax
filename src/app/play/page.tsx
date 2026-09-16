@@ -121,7 +121,7 @@ function PlayPageContent() {
             gameMode: "PRIVATE_ROOM",
             arena,
             maxPlayers,
-            characterId: selectedChar._id || selectedChar.slug,
+            characterId: selectedChar.slug || "blaze",
           }),
         });
         const data = await res.json();
@@ -140,7 +140,7 @@ function PlayPageContent() {
         body: JSON.stringify({
           gameMode: "QUICK_MATCH",
           arena,
-          characterId: selectedChar._id || selectedChar.slug,
+          characterId: selectedChar.slug || "blaze",
         }),
       });
       const data = await res.json();
@@ -166,7 +166,7 @@ function PlayPageContent() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           roomCode: joinCode.toUpperCase(),
-          characterId: selectedChar._id || selectedChar.slug,
+          characterId: selectedChar.slug || "blaze",
         }),
       });
       const data = await res.json();

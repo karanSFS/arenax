@@ -4,25 +4,36 @@ import { useEffect, useRef, useState, useCallback, Suspense } from "react";
 import { useSearchParams, useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Heart, Skull, Trophy, Clock, ChevronRight } from "lucide-react";
+import { Heart, Skull, Trophy, Clock, ChevronRight, Volume2, VolumeX } from "lucide-react";
 import type { GameEngine, HUDData, MatchStats } from "@/game/engine/GameEngine";
 import type { TouchController } from "@/game/input/InputController";
 import { TouchControlsOverlay } from "@/components/game/TouchControlsOverlay";
+import { soundManager } from "@/game/audio/SoundManager";
 import { formatDuration } from "@/lib/utils/progression";
 import { Button } from "@/components/ui/Button";
 import { useToast } from "@/components/providers/ToastProvider";
 
 // ─── HUD Overlay ──────────────────────────────────────────────────────────────
-function HUD({ data, characterColor }: { data: HUDData; characterColor: string }) {
+function HUD({
+  data,
+  characterColor,
+  isMuted,
+  onToggleMute,
+}: {
+  data: HUDData;
+  characterColor: string;
+  isMuted: boolean;
+  onToggleMute: () => void;
+}) {
   const { localPlayer, timeRemaining, killFeed } = data;
   const hpPct = (localPlayer.health / localPlayer.maxHealth) * 100;
 
   return (
     <div className="absolute inset-0 pointer-events-none" style={{ fontFamily: "'Orbitron', monospace" }}>
       {/* Top HUD */}
-      <div className="absolute top-4 left-4 right-4 flex items-start justify-between">
+      <div className="absolute top-4 left-4 right-4 flex items-start justify-between gap-2">
         {/* Player HP */}
-        <div className="glass rounded-xl px-4 py-3 border border-white/10 min-w-[200px]">
+        <div className="glass rounded-xl px-4 py-3 border border-white/10 min-w-[180px] sm:min-w-[200px]">
           <div className="flex items-center gap-2 mb-2">
             <Heart size={14} className={hpPct > 50 ? "text-neon-green" : hpPct > 25 ? "text-yellow-400" : "text-neon-pink"} />
             <span className="text-xs text-slate-400 uppercase tracking-widest">HP</span>
@@ -42,14 +53,25 @@ function HUD({ data, characterColor }: { data: HUDData; characterColor: string }
           </div>
         </div>
 
-        {/* Timer */}
-        <div className="glass rounded-xl px-5 py-3 border border-white/10 text-center">
-          <div className="flex items-center gap-2">
-            <Clock size={14} className="text-slate-400" />
-            <span className="text-xl font-black text-white">
-              {formatDuration(Math.max(0, Math.ceil(timeRemaining)))}
-            </span>
+        {/* Center: Timer & Audio Toggle */}
+        <div className="flex items-center gap-2">
+          <div className="glass rounded-xl px-5 py-3 border border-white/10 text-center">
+            <div className="flex items-center gap-2">
+              <Clock size={14} className="text-slate-400" />
+              <span className="text-xl font-black text-white">
+                {formatDuration(Math.max(0, Math.ceil(timeRemaining)))}
+              </span>
+            </div>
           </div>
+
+          <button
+            type="button"
+            onClick={onToggleMute}
+            title={isMuted ? "Unmute Audio" : "Mute Audio"}
+            className="pointer-events-auto p-3 rounded-xl glass border border-white/10 hover:border-neon-cyan/50 text-slate-300 hover:text-white transition-all shadow-lg active:scale-95"
+          >
+            {isMuted ? <VolumeX size={18} className="text-neon-pink" /> : <Volume2 size={18} className="text-neon-cyan" />}
+          </button>
         </div>
 
         {/* Score */}
@@ -249,9 +271,23 @@ function GamePageContent() {
   const [isLoading, setIsLoading] = useState(true);
   const [characterColor, setCharacterColor] = useState("#00f5ff");
   const [touchController, setTouchController] = useState<TouchController | null>(null);
+  const [isMuted, setIsMuted] = useState(soundManager.getMuted());
+
+  const cleanCharacterSlug = (() => {
+    const s = (characterSlug || "blaze").toLowerCase();
+    if (s.includes("volt")) return "volt";
+    if (s.includes("titan")) return "titan";
+    if (s.includes("phantom")) return "phantom";
+    return "blaze";
+  })();
 
   const userId = (session?.user as { id?: string })?.id || "player-1";
   const username = (session?.user as { username?: string })?.username || session?.user?.name || "Player";
+
+  const handleToggleMute = useCallback(() => {
+    const next = soundManager.toggleMute();
+    setIsMuted(next);
+  }, []);
 
   const handleMatchEnd = useCallback(async (winner: { userId: string; username: string }, stats: MatchStats) => {
     setMatchStats(stats);
@@ -310,12 +346,17 @@ function GamePageContent() {
       engineRef.current = engine;
       setTouchController(engine.getTouchController());
 
+      // Distinct spawn point based on user hash
+      const spawnIdx = Math.abs(
+        userId.split("").reduce((acc, char) => acc + char.charCodeAt(0), 0)
+      ) % 20;
+
       // Setup local player
-      engine.setupLocalPlayer(userId, username, characterSlug);
+      engine.setupLocalPlayer(userId, username, cleanCharacterSlug, spawnIdx);
 
       // Get character color for HUD
       import("@/game/characters/CharacterConfig").then(({ CHARACTER_DATA }) => {
-        const char = CHARACTER_DATA.find((c) => c.slug === characterSlug);
+        const char = CHARACTER_DATA.find((c) => c.slug === cleanCharacterSlug);
         if (char) setCharacterColor(char.color);
       });
 
@@ -338,17 +379,19 @@ function GamePageContent() {
                   ...localState,
                   userId,
                   username,
-                  characterSlug,
+                  characterSlug: cleanCharacterSlug,
                 },
               }),
             });
 
             if (res.ok) {
               const data = await res.json();
-              if (data.success && Array.isArray(data.players)) {
-                for (const p of data.players) {
-                  if (p.id === userId || p.userId === userId) continue;
-                  engine.updateRemotePlayer(p.id || p.userId, p);
+              const playersList = data.players || data.data?.players;
+              if (Array.isArray(playersList)) {
+                for (const p of playersList) {
+                  const pid = p.userId || p.id;
+                  if (!pid || pid === userId) continue;
+                  engine.updateRemotePlayer(pid, p);
                 }
               }
             }
@@ -359,9 +402,9 @@ function GamePageContent() {
           }
         }, 85);
       } else {
-        // Add AI bot for practice/quick match
+        // Add AI bot for practice/quick match only
         import("@/game/ai/BotAI").then(() => {
-          const botChars = ["volt", "titan", "phantom", "blaze"].filter((s) => s !== characterSlug);
+          const botChars = ["volt", "titan", "phantom", "blaze"].filter((s) => s !== cleanCharacterSlug);
           engine.addBot(botChars[0], mode === "PRACTICE" ? "normal" : "hard");
         });
       }
@@ -375,7 +418,7 @@ function GamePageContent() {
       engine?.destroy();
       window.removeEventListener("resize", resize);
     };
-  }, [userId, username, characterSlug, arenaId, mode, roomCode, handleMatchEnd]);
+  }, [userId, username, cleanCharacterSlug, arenaId, mode, roomCode, handleMatchEnd]);
 
   function handlePlayAgain() {
     router.push("/play");
@@ -439,7 +482,14 @@ function GamePageContent() {
       />
 
       {/* HUD */}
-      {hud && !matchStats && <HUD data={hud} characterColor={characterColor} />}
+      {hud && !matchStats && (
+        <HUD
+          data={hud}
+          characterColor={characterColor}
+          isMuted={isMuted}
+          onToggleMute={handleToggleMute}
+        />
+      )}
 
       {/* Match Result */}
       {matchStats && (

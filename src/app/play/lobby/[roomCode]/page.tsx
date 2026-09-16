@@ -42,11 +42,26 @@ const arenaNames: Record<string, string> = {
 };
 
 const characterNames: Record<string, string> = {
-  blaze: "BLAZE (Melee)",
-  volt: "VOLT (Ranged)",
+  blaze: "BLAZE (Brawler)",
+  volt: "VOLT (Marksman)",
   titan: "TITAN (Tank)",
   phantom: "PHANTOM (Assassin)",
 };
+
+function getSafeCharacterSlug(raw?: string): string {
+  if (!raw) return "blaze";
+  const s = raw.toLowerCase();
+  if (s.includes("volt")) return "volt";
+  if (s.includes("titan")) return "titan";
+  if (s.includes("phantom")) return "phantom";
+  if (s.includes("blaze")) return "blaze";
+  return "blaze";
+}
+
+function getCharacterLabel(raw?: string): string {
+  const slug = getSafeCharacterSlug(raw);
+  return characterNames[slug] || "BLAZE (Brawler)";
+}
 
 export default function LobbyPage() {
   const params = useParams();
@@ -74,7 +89,7 @@ export default function LobbyPage() {
           setRoom(data.data);
           if (data.data.status === "IN_PROGRESS") {
             const me = data.data.players.find((p: RoomPlayer) => p.userId === userId);
-            const characterSlug = me?.characterId || "blaze";
+            const characterSlug = getSafeCharacterSlug(me?.characterId);
             const matchId = data.data.matchId || roomCode;
             router.push(
               `/play/game?mode=PRIVATE_ROOM&roomCode=${roomCode}&character=${characterSlug}&arena=${data.data.arena}&matchId=${matchId}`
@@ -119,7 +134,7 @@ export default function LobbyPage() {
       }
 
       const me = room.players.find((p) => p.userId === userId);
-      const characterSlug = me?.characterId || "blaze";
+      const characterSlug = getSafeCharacterSlug(me?.characterId);
       const matchId = data.data?.matchId || room.matchId || roomCode;
 
       router.push(
@@ -228,10 +243,13 @@ export default function LobbyPage() {
                         )}
                       </div>
                       <p className="text-xs text-slate-400 font-display truncate mt-0.5">
-                        {characterNames[player.characterId] || (player.characterId ? player.characterId.toUpperCase() : "Selecting...")}
+                        {getCharacterLabel(player.characterId)}
                       </p>
                     </div>
-                    <div className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${player.isHost || player.isReady ? "bg-neon-green shadow-neon-green" : "bg-slate-600"}`} />
+                    <div className="flex items-center gap-1.5 flex-shrink-0">
+                      <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 shadow-[0_0_10px_#34d399] animate-pulse" />
+                      <span className="text-[10px] font-mono font-bold text-emerald-400 tracking-wider">READY</span>
+                    </div>
                   </motion.div>
                 ))}
 

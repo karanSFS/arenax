@@ -1,9 +1,11 @@
 import { NextRequest, NextResponse } from "next/server";
 import { auth } from "@/lib/auth";
+import { connectDB } from "@/lib/mongodb";
+import mongoose from "mongoose";
 
 export const dynamic = "force-dynamic";
 
-interface PlayerSyncPayload {
+export interface PlayerSyncPayload {
   userId: string;
   username: string;
   characterSlug: string;
@@ -26,7 +28,7 @@ interface PlayerSyncPayload {
   updatedAt: number;
 }
 
-// In-memory global store across requests in same process
+// In-memory local cache across requests in the same lambda
 declare global {
   // eslint-disable-next-line no-var
   var _arenaxRoomSync: Map<string, Map<string, PlayerSyncPayload>> | undefined;
@@ -42,62 +44,128 @@ export async function POST(
 ) {
   try {
     const session = await auth();
-    const userId =
+    const roomCode = params.roomCode.toUpperCase();
+    const body = await req.json();
+
+    // Support both direct payload or wrapped in .state
+    const pData = body.state || body;
+    const callerId =
+      body.playerId ||
+      pData.userId ||
       (session?.user as { id?: string })?.id ||
       req.headers.get("x-player-id") ||
       "anon-" + req.ip;
 
-    const roomCode = params.roomCode.toUpperCase();
-    const body = await req.json();
+    const callerName =
+      pData.username ||
+      (session?.user as { username?: string })?.username ||
+      session?.user?.name ||
+      "Player";
 
-    const rooms = global._arenaxRoomSync!;
-    if (!rooms.has(roomCode)) {
-      rooms.set(roomCode, new Map());
-    }
+    const callerChar = pData.characterSlug || "blaze";
 
-    const roomPlayers = rooms.get(roomCode)!;
     const now = Date.now();
 
-    // Clean up stale players (> 8 seconds without update)
-    for (const [pId, pData] of roomPlayers.entries()) {
-      if (now - pData.updatedAt > 8000) {
-        roomPlayers.delete(pId);
-      }
-    }
-
-    // Save current player payload
     const playerPayload: PlayerSyncPayload = {
-      userId: body.userId || userId,
-      username: body.username || (session?.user?.name ?? "Player"),
-      characterSlug: body.characterSlug || "blaze",
-      x: body.x || 0,
-      y: body.y || 0,
-      vx: body.vx || 0,
-      vy: body.vy || 0,
-      facing: body.facing || 0,
-      health: body.health !== undefined ? body.health : 100,
-      maxHealth: body.maxHealth || 100,
-      score: body.score || 0,
-      kills: body.kills || 0,
-      deaths: body.deaths || 0,
-      isAlive: body.isAlive !== undefined ? body.isAlive : true,
-      action: body.action,
-      signal: body.signal,
+      userId: callerId,
+      username: callerName,
+      characterSlug: callerChar,
+      x: typeof pData.x === "number" ? pData.x : 1200,
+      y: typeof pData.y === "number" ? pData.y : 700,
+      vx: typeof pData.vx === "number" ? pData.vx : 0,
+      vy: typeof pData.vy === "number" ? pData.vy : 0,
+      facing: typeof pData.facing === "number" ? pData.facing : 0,
+      health: typeof pData.health === "number" ? pData.health : 100,
+      maxHealth: typeof pData.maxHealth === "number" ? pData.maxHealth : 100,
+      score: typeof pData.score === "number" ? pData.score : 0,
+      kills: typeof pData.kills === "number" ? pData.kills : 0,
+      deaths: typeof pData.deaths === "number" ? pData.deaths : 0,
+      isAlive: typeof pData.isAlive === "boolean" ? pData.isAlive : true,
+      action: pData.action || body.action,
+      signal: pData.signal || body.signal,
       updatedAt: now,
     };
 
-    roomPlayers.set(playerPayload.userId, playerPayload);
+    // 1. Update in-memory local layer
+    const memRooms = global._arenaxRoomSync!;
+    if (!memRooms.has(roomCode)) {
+      memRooms.set(roomCode, new Map());
+    }
+    const memRoom = memRooms.get(roomCode)!;
+    memRoom.set(callerId, playerPayload);
 
-    // Return all other active players in room
-    const otherPlayers: PlayerSyncPayload[] = [];
-    for (const [pId, pData] of roomPlayers.entries()) {
-      if (pId !== playerPayload.userId) {
-        otherPlayers.push(pData);
+    // 2. Persist to MongoDB room_states so all Vercel serverless lambdas share real-time state
+    try {
+      await connectDB();
+      const db = mongoose.connection.db;
+      if (db) {
+        const col = db.collection("room_states");
+        await col.updateOne(
+          { _id: `${roomCode}:${callerId}` as any },
+          {
+            $set: {
+              ...playerPayload,
+              roomCode,
+              updatedAtDate: new Date(),
+            },
+          },
+          { upsert: true }
+        );
+
+        // Fetch all active players in this room updated within last 5 seconds
+        const activeSince = new Date(Date.now() - 5000);
+        const dbDocs = await col
+          .find({ roomCode, updatedAtDate: { $gt: activeSince } })
+          .toArray();
+
+        // Merge DB players into memory layer
+        for (const doc of dbDocs) {
+          if (doc.userId) {
+            memRoom.set(doc.userId, {
+              userId: doc.userId,
+              username: doc.username,
+              characterSlug: doc.characterSlug,
+              x: doc.x,
+              y: doc.y,
+              vx: doc.vx,
+              vy: doc.vy,
+              facing: doc.facing,
+              health: doc.health,
+              maxHealth: doc.maxHealth,
+              score: doc.score,
+              kills: doc.kills,
+              deaths: doc.deaths,
+              isAlive: doc.isAlive,
+              action: doc.action,
+              signal: doc.signal,
+              updatedAt: doc.updatedAt || Date.now(),
+            });
+          }
+        }
+      }
+    } catch (dbErr) {
+      console.warn("MongoDB room_sync fallback to in-memory:", dbErr);
+    }
+
+    // Clean up stale memory records (> 6 seconds)
+    for (const [pId, p] of memRoom.entries()) {
+      if (now - p.updatedAt > 6000) {
+        memRoom.delete(pId);
       }
     }
 
+    // Extract all other players in this room
+    const otherPlayers: PlayerSyncPayload[] = [];
+    for (const [pId, p] of memRoom.entries()) {
+      if (pId !== callerId) {
+        otherPlayers.push(p);
+      }
+    }
+
+    // Provide both top-level `players` and `data.players` for absolute compatibility
     return NextResponse.json({
       success: true,
+      players: otherPlayers,
       data: {
         timestamp: now,
         players: otherPlayers,
