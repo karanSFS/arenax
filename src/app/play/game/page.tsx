@@ -6,6 +6,8 @@ import { useSession } from "next-auth/react";
 import { motion, AnimatePresence } from "framer-motion";
 import { Heart, Skull, Trophy, Clock, ChevronRight } from "lucide-react";
 import type { GameEngine, HUDData, MatchStats } from "@/game/engine/GameEngine";
+import type { TouchController } from "@/game/input/InputController";
+import { TouchControlsOverlay } from "@/components/game/TouchControlsOverlay";
 import { formatDuration } from "@/lib/utils/progression";
 import { Button } from "@/components/ui/Button";
 import { useToast } from "@/components/providers/ToastProvider";
@@ -237,6 +239,7 @@ function GamePageContent() {
   const characterSlug = searchParams.get("character") || "blaze";
   const arenaId = searchParams.get("arena") || "cyber_grid";
   const matchId = searchParams.get("matchId");
+  const roomCode = searchParams.get("roomCode");
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const engineRef = useRef<GameEngine | null>(null);
@@ -245,6 +248,7 @@ function GamePageContent() {
   const [matchStats, setMatchStats] = useState<MatchStats | null>(null);
   const [isLoading, setIsLoading] = useState(true);
   const [characterColor, setCharacterColor] = useState("#00f5ff");
+  const [touchController, setTouchController] = useState<TouchController | null>(null);
 
   const userId = (session?.user as { id?: string })?.id || "player-1";
   const username = (session?.user as { username?: string })?.username || session?.user?.name || "Player";
@@ -294,6 +298,7 @@ function GamePageContent() {
     window.addEventListener("resize", resize);
 
     let engine: GameEngine;
+    let syncInterval: NodeJS.Timeout | null = null;
 
     // Dynamic import to avoid SSR issues
     import("@/game/engine/GameEngine").then(({ GameEngine }) => {
@@ -303,6 +308,7 @@ function GamePageContent() {
       });
 
       engineRef.current = engine;
+      setTouchController(engine.getTouchController());
 
       // Setup local player
       engine.setupLocalPlayer(userId, username, characterSlug);
@@ -313,21 +319,63 @@ function GamePageContent() {
         if (char) setCharacterColor(char.color);
       });
 
-      // Add AI bot for practice/quick match
-      import("@/game/ai/BotAI").then(() => {
-        const botChars = ["volt", "titan", "phantom", "blaze"].filter((s) => s !== characterSlug);
-        engine.addBot(botChars[0], mode === "PRACTICE" ? "normal" : "hard");
-      });
+      if (mode === "PRIVATE_ROOM" && roomCode) {
+        // High-frequency multiplayer state sync for up to 20 players
+        let isSyncing = false;
+        syncInterval = setInterval(async () => {
+          if (isSyncing) return;
+          isSyncing = true;
+          try {
+            const localState = engine.getLocalPlayerState();
+            if (!localState) return;
+
+            const res = await fetch(`/api/rooms/${roomCode}/sync`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                playerId: userId,
+                state: {
+                  ...localState,
+                  userId,
+                  username,
+                  characterSlug,
+                },
+              }),
+            });
+
+            if (res.ok) {
+              const data = await res.json();
+              if (data.success && Array.isArray(data.players)) {
+                for (const p of data.players) {
+                  if (p.id === userId || p.userId === userId) continue;
+                  engine.updateRemotePlayer(p.id || p.userId, p);
+                }
+              }
+            }
+          } catch {
+            // Silently handle momentary network drops during real-time sync
+          } finally {
+            isSyncing = false;
+          }
+        }, 85);
+      } else {
+        // Add AI bot for practice/quick match
+        import("@/game/ai/BotAI").then(() => {
+          const botChars = ["volt", "titan", "phantom", "blaze"].filter((s) => s !== characterSlug);
+          engine.addBot(botChars[0], mode === "PRACTICE" ? "normal" : "hard");
+        });
+      }
 
       engine.start();
       setIsLoading(false);
     });
 
     return () => {
+      if (syncInterval) clearInterval(syncInterval);
       engine?.destroy();
       window.removeEventListener("resize", resize);
     };
-  }, [userId, username, characterSlug, arenaId, mode, handleMatchEnd]);
+  }, [userId, username, characterSlug, arenaId, mode, roomCode, handleMatchEnd]);
 
   function handlePlayAgain() {
     router.push("/play");
@@ -373,6 +421,21 @@ function GamePageContent() {
         className="w-full h-full block"
         style={{ touchAction: "none" }}
         aria-label="Game arena"
+      />
+
+      {/* Mobile Touch Controls */}
+      <TouchControlsOverlay
+        touchController={touchController}
+        characterSlug={characterSlug}
+        cooldowns={
+          hud
+            ? {
+                primary: hud.localPlayer.abilities.primary.cooldown,
+                secondary: hud.localPlayer.abilities.secondary.cooldown,
+                ultimate: hud.localPlayer.abilities.ultimate.cooldown,
+              }
+            : undefined
+        }
       />
 
       {/* HUD */}

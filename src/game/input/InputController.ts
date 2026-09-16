@@ -90,6 +90,7 @@ export class TouchController {
   private ultimatePressed = false;
   private aimX = 0;
   private aimY = 0;
+  private hasAim = false;
   private sequence = 0;
 
   setJoystick(dx: number, dy: number) {
@@ -100,10 +101,26 @@ export class TouchController {
   setAbility1(v: boolean) { this.ability1Pressed = v; }
   setAbility2(v: boolean) { this.ability2Pressed = v; }
   setUltimate(v: boolean) { this.ultimatePressed = v; }
-  setAim(x: number, y: number) { this.aimX = x; this.aimY = y; }
+  setAim(x: number, y: number) {
+    this.aimX = x;
+    this.aimY = y;
+    this.hasAim = true;
+  }
+  clearAim() {
+    this.hasAim = false;
+  }
+
+  resetAll() {
+    this.joystickDelta = { x: 0, y: 0 };
+    this.attackPressed = false;
+    this.ability1Pressed = false;
+    this.ability2Pressed = false;
+    this.ultimatePressed = false;
+    this.hasAim = false;
+  }
 
   getState(): InputState {
-    const threshold = 0.3;
+    const threshold = 0.25;
     return {
       up: this.joystickDelta.y < -threshold,
       down: this.joystickDelta.y > threshold,

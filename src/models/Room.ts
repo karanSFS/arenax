@@ -13,9 +13,18 @@ export interface RoomDocument extends Document {
   hostUserId: string;
   players: RoomPlayerDoc[];
   gameMode: "QUICK_MATCH" | "PRIVATE_ROOM" | "PRACTICE";
-  arena: "cyber_grid" | "void_core" | "industrial_zone";
+  arena:
+    | "cyber_grid"
+    | "void_core"
+    | "industrial_zone"
+    | "outpost"
+    | "catacombs"
+    | "high_tower"
+    | "pyramid"
+    | "lunar_base";
   status: "WAITING" | "READY" | "STARTING" | "IN_PROGRESS" | "FINISHED" | "CANCELLED";
   maxPlayers: number;
+  matchId?: string;
   createdAt: Date;
   updatedAt: Date;
   startedAt?: Date;
@@ -41,7 +50,16 @@ const RoomSchema = new Schema<RoomDocument>(
     },
     arena: {
       type: String,
-      enum: ["cyber_grid", "void_core", "industrial_zone"],
+      enum: [
+        "cyber_grid",
+        "void_core",
+        "industrial_zone",
+        "outpost",
+        "catacombs",
+        "high_tower",
+        "pyramid",
+        "lunar_base",
+      ],
       default: "cyber_grid",
     },
     status: {
@@ -49,7 +67,8 @@ const RoomSchema = new Schema<RoomDocument>(
       enum: ["WAITING", "READY", "STARTING", "IN_PROGRESS", "FINISHED", "CANCELLED"],
       default: "WAITING",
     },
-    maxPlayers: { type: Number, default: 2, min: 2, max: 4 },
+    maxPlayers: { type: Number, default: 8, min: 2, max: 20 },
+    matchId: { type: String },
     startedAt: { type: Date },
   },
   {

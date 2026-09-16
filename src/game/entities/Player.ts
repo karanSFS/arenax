@@ -179,6 +179,32 @@ export class Player {
     this.ultimateCooldown = Math.max(0, this.ultimateCooldown - dt);
   }
 
+  setRemoteState(data: {
+    x?: number;
+    y?: number;
+    vx?: number;
+    vy?: number;
+    facing?: number;
+    health?: number;
+    maxHealth?: number;
+    score?: number;
+    kills?: number;
+    deaths?: number;
+    isAlive?: boolean;
+  }) {
+    if (data.x !== undefined) this.targetX = data.x;
+    if (data.y !== undefined) this.targetY = data.y;
+    if (data.vx !== undefined) this.vx = data.vx;
+    if (data.vy !== undefined) this.vy = data.vy;
+    if (data.facing !== undefined) this.facing = data.facing;
+    if (data.health !== undefined) this.health = data.health;
+    if (data.maxHealth !== undefined) this.maxHealth = data.maxHealth;
+    if (data.score !== undefined) this.score = data.score;
+    if (data.kills !== undefined) this.kills = data.kills;
+    if (data.deaths !== undefined) this.deaths = data.deaths;
+    if (data.isAlive !== undefined) this.isAlive = data.isAlive;
+  }
+
   applyInput(input: { up: boolean; down: boolean; left: boolean; right: boolean; aimX: number; aimY: number }, camX: number, camY: number) {
     let dx = 0, dy = 0;
     if (input.up) dy -= 1;
@@ -204,7 +230,11 @@ export class Player {
     // Facing angle
     const screenX = this.x - camX;
     const screenY = this.y - camY;
-    this.facing = Math.atan2(input.aimY - screenY, input.aimX - screenX);
+    if (Math.abs(input.aimX) > 0.001 || Math.abs(input.aimY) > 0.001) {
+      this.facing = Math.atan2(input.aimY - screenY, input.aimX - screenX);
+    } else if (Math.hypot(this.vx, this.vy) > 10) {
+      this.facing = Math.atan2(this.vy, this.vx);
+    }
   }
 
   takeDamage(amount: number, attackerDefense = 0): number {

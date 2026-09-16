@@ -75,7 +75,7 @@ export class GameEngine {
   private projectiles: Map<string, ProjectileData> = new Map();
   private particles: ParticleSystem;
   private keyboard!: KeyboardController;
-  private touchController?: TouchController;
+  private touchController: TouchController = new TouchController();
   private callbacks: GameEngineCallbacks;
 
   // Game state
@@ -155,6 +155,70 @@ export class GameEngine {
     this.touchController = tc;
   }
 
+  addRemotePlayer(id: string, userId: string, username: string, characterSlug: string, x?: number, y?: number) {
+    if (this.remotePlayers.has(id) || (this.localPlayer && this.localPlayer.id === id)) return;
+    const spawnIdx = (this.remotePlayers.size + 1) % this.arena.spawnPoints.length;
+    const spawn = this.arena.spawnPoints[spawnIdx];
+    const player = new Player(
+      { id, userId, username, characterSlug, isLocal: false },
+      x !== undefined ? x : spawn.x,
+      y !== undefined ? y : spawn.y
+    );
+    this.remotePlayers.set(id, player);
+  }
+
+  updateRemotePlayer(id: string, data: any) {
+    const player = this.remotePlayers.get(id);
+    if (!player) {
+      if (data.userId && data.username && data.characterSlug) {
+        this.addRemotePlayer(id, data.userId, data.username, data.characterSlug, data.x, data.y);
+      }
+      return;
+    }
+    player.setRemoteState(data);
+  }
+
+  removeRemotePlayer(id: string) {
+    this.remotePlayers.delete(id);
+  }
+
+  triggerRemoteAction(id: string, action: { type: string; data?: any }) {
+    const player = this.remotePlayers.get(id);
+    if (!player) return;
+
+    if (action.type === "primary") {
+      const res = player.activatePrimary();
+      if (res?.projectile) this.spawnProjectile(res.projectile);
+    } else if (action.type === "secondary") {
+      const res = player.activateSecondary();
+      if (res?.projectile) this.spawnProjectile(res.projectile);
+    } else if (action.type === "ultimate") {
+      const res = player.activateUltimate();
+      if (res?.projectile) this.spawnProjectile(res.projectile);
+      if (res?.aoe) this.processAOE(player, res.aoe.x, res.aoe.y, res.aoe.radius, res.aoe.damage);
+    }
+  }
+
+  getLocalPlayerState() {
+    if (!this.localPlayer) return null;
+    return {
+      userId: this.localPlayer.userId,
+      username: this.localPlayer.username,
+      characterSlug: this.localPlayer.characterSlug,
+      x: Math.round(this.localPlayer.x),
+      y: Math.round(this.localPlayer.y),
+      vx: Math.round(this.localPlayer.vx),
+      vy: Math.round(this.localPlayer.vy),
+      facing: parseFloat(this.localPlayer.facing.toFixed(3)),
+      health: Math.round(this.localPlayer.health),
+      maxHealth: this.localPlayer.maxHealth,
+      score: this.localPlayer.score,
+      kills: this.localPlayer.kills,
+      deaths: this.localPlayer.deaths,
+      isAlive: this.localPlayer.isAlive,
+    };
+  }
+
   // ─── Game Loop ─────────────────────────────────────────────────────────────
 
   start() {
@@ -197,9 +261,21 @@ export class GameEngine {
     }
 
     // ── Input ────────────────────────────────────────────────
-    const input = this.touchController
-      ? this.touchController.getState()
-      : this.keyboard.getState();
+    const kb = this.keyboard.getState();
+    const touch = this.touchController.getState();
+    const input: InputState = {
+      up: kb.up || touch.up,
+      down: kb.down || touch.down,
+      left: kb.left || touch.left,
+      right: kb.right || touch.right,
+      attack: kb.attack || touch.attack,
+      ability1: kb.ability1 || touch.ability1,
+      ability2: kb.ability2 || touch.ability2,
+      ultimate: kb.ultimate || touch.ultimate,
+      aimX: (touch.aimX !== 0 || touch.aimY !== 0) ? touch.aimX : kb.aimX,
+      aimY: (touch.aimX !== 0 || touch.aimY !== 0) ? touch.aimY : kb.aimY,
+      sequence: kb.sequence + touch.sequence,
+    };
 
     // ── Local player ─────────────────────────────────────────
     if (this.localPlayer) {
@@ -560,10 +636,26 @@ export class GameEngine {
       this.renderPlayer(ctx, this.localPlayer);
     }
 
-    // Projectiles
+    // Projectiles with high-energy glowing streak tails
     for (const proj of this.projectiles.values()) {
       ctx.save();
-      ctx.fillStyle = proj.color;
+      const speed = Math.hypot(proj.vx, proj.vy);
+      if (speed > 1) {
+        const nx = proj.vx / speed;
+        const ny = proj.vy / speed;
+        const tailLength = Math.min(26, proj.radius * 3.5);
+        const grad = ctx.createLinearGradient(proj.x, proj.y, proj.x - nx * tailLength, proj.y - ny * tailLength);
+        grad.addColorStop(0, proj.color);
+        grad.addColorStop(1, "transparent");
+        ctx.strokeStyle = grad;
+        ctx.lineWidth = proj.radius * 1.8;
+        ctx.lineCap = "round";
+        ctx.beginPath();
+        ctx.moveTo(proj.x, proj.y);
+        ctx.lineTo(proj.x - nx * tailLength, proj.y - ny * tailLength);
+        ctx.stroke();
+      }
+      ctx.fillStyle = "#ffffff";
       ctx.shadowBlur = proj.radius * 3;
       ctx.shadowColor = proj.color;
       ctx.beginPath();
@@ -651,72 +743,372 @@ export class GameEngine {
   private renderPlayer(ctx: CanvasRenderingContext2D, player: Player) {
     if (!player.isAlive) return;
 
-    const { x, y, radius, color, accentColor, facing, hitFlash, isInvisible } = player;
+    const { x, y, radius, color, accentColor, facing, hitFlash, isInvisible, characterSlug } = player;
 
     if (isInvisible && !player.isLocal) return;
 
+    const isMoving = Math.hypot(player.vx, player.vy) > 10;
+    const now = Date.now();
+
+    // 1. Ground Shadow
     ctx.save();
-    ctx.globalAlpha = isInvisible ? 0.3 : 1;
-
-    // Hit flash
-    if (hitFlash > 0) {
-      ctx.globalAlpha = 0.5 + hitFlash * 0.5;
-    }
-
-    // Outer glow
-    ctx.shadowBlur = 20 + (hitFlash > 0 ? 15 : 0);
-    ctx.shadowColor = hitFlash > 0 ? "#ffffff" : color;
-
-    // Body
-    ctx.fillStyle = hitFlash > 0 ? "#ffffff" : color;
+    ctx.fillStyle = "rgba(0, 0, 0, 0.45)";
     ctx.beginPath();
-    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.ellipse(x, y + 5, radius * 0.9, radius * 0.55, 0, 0, Math.PI * 2);
     ctx.fill();
-
-    // Inner ring
-    ctx.strokeStyle = accentColor;
-    ctx.lineWidth = 3;
-    ctx.shadowColor = accentColor;
-    ctx.shadowBlur = 15;
-    ctx.beginPath();
-    ctx.arc(x, y, radius - 4, 0, Math.PI * 2);
-    ctx.stroke();
-
-    // Direction indicator
-    ctx.fillStyle = "#ffffff";
-    ctx.shadowBlur = 0;
-    ctx.beginPath();
-    ctx.arc(
-      x + Math.cos(facing) * (radius - 6),
-      y + Math.sin(facing) * (radius - 6),
-      6,
-      0,
-      Math.PI * 2
-    );
-    ctx.fill();
-
     ctx.restore();
 
-    // Health bar (above player)
-    const barW = 50;
+    // 2. Tactical Player Indicator (Local Player Highlight)
+    if (player.isLocal) {
+      const rot = now * 0.0025;
+      ctx.save();
+      ctx.strokeStyle = "rgba(0, 245, 255, 0.6)";
+      ctx.lineWidth = 1.5;
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = "#00f5ff";
+      ctx.beginPath();
+      ctx.arc(x, y, radius + 8, rot, rot + Math.PI * 1.4);
+      ctx.stroke();
+
+      // Front directional indicator pip
+      const tipDist = radius + 12;
+      ctx.fillStyle = "#00f5ff";
+      ctx.beginPath();
+      ctx.arc(x + Math.cos(facing) * tipDist, y + Math.sin(facing) * tipDist, 3, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
+
+    // 3. Rotated Fighter Rendering (+X is Forward / Facing)
+    ctx.save();
+    ctx.translate(x, y);
+    ctx.rotate(facing);
+
+    if (isInvisible) {
+      ctx.globalAlpha = 0.35;
+    }
+    if (hitFlash > 0) {
+      ctx.globalAlpha = Math.min(1, 0.6 + hitFlash * 0.4);
+    }
+
+    // A. Mini-Militia Jetpack Thruster Flames (Shooting backwards, -X direction)
+    const flameBaseX = -radius + 4;
+    const thrusterY1 = -9;
+    const thrusterY2 = 9;
+
+    // Thruster Mounts
+    ctx.fillStyle = "#1e293b";
+    ctx.strokeStyle = "#475569";
+    ctx.lineWidth = 1.5;
+    ctx.fillRect(flameBaseX - 3, thrusterY1 - 3, 6, 6);
+    ctx.strokeRect(flameBaseX - 3, thrusterY1 - 3, 6, 6);
+    ctx.fillRect(flameBaseX - 3, thrusterY2 - 3, 6, 6);
+    ctx.strokeRect(flameBaseX - 3, thrusterY2 - 3, 6, 6);
+
+    if (isMoving) {
+      const flameLen = 14 + Math.sin(now * 0.035) * 6;
+      for (const ty of [thrusterY1, thrusterY2]) {
+        ctx.save();
+        const flameGrad = ctx.createLinearGradient(flameBaseX, ty, flameBaseX - flameLen, ty);
+        flameGrad.addColorStop(0, "#ffffff");
+        flameGrad.addColorStop(0.3, accentColor || "#00f5ff");
+        flameGrad.addColorStop(0.7, color || "#ff6b00");
+        flameGrad.addColorStop(1, "transparent");
+
+        ctx.fillStyle = flameGrad;
+        ctx.shadowBlur = 12;
+        ctx.shadowColor = accentColor || "#00f5ff";
+        ctx.beginPath();
+        ctx.moveTo(flameBaseX - 2, ty - 3.5);
+        ctx.lineTo(flameBaseX - flameLen, ty + (Math.random() - 0.5) * 3);
+        ctx.lineTo(flameBaseX - 2, ty + 3.5);
+        ctx.closePath();
+        ctx.fill();
+        ctx.restore();
+      }
+    }
+
+    // B. Shoulder Pauldrons (Left & Right armored shoulder plates)
+    const pauldronW = characterSlug === "titan" ? 14 : 11;
+    const pauldronH = characterSlug === "titan" ? 10 : 8;
+    const pauldronSpread = characterSlug === "titan" ? 18 : 15;
+
+    for (const side of [-1, 1]) {
+      const py = side * pauldronSpread;
+      ctx.save();
+      ctx.fillStyle = "#0f172a";
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.shadowBlur = 6;
+      ctx.shadowColor = color;
+
+      ctx.beginPath();
+      ctx.roundRect(-5, py - pauldronH / 2, pauldronW, pauldronH, 4);
+      ctx.fill();
+      ctx.stroke();
+
+      // Pauldron crest stripe
+      ctx.fillStyle = accentColor;
+      ctx.fillRect(-2, py - 2, 5, 4);
+      ctx.restore();
+    }
+
+    // C. Armored Torso / Exosuit Chassis
+    ctx.save();
+    ctx.fillStyle = hitFlash > 0 ? "#ffffff" : "#111827";
+    ctx.strokeStyle = hitFlash > 0 ? "#ffffff" : color;
+    ctx.lineWidth = 2.5;
+    ctx.shadowBlur = hitFlash > 0 ? 15 : 8;
+    ctx.shadowColor = hitFlash > 0 ? "#ffffff" : color;
+
+    // Tactical vest silhouette
+    ctx.beginPath();
+    ctx.moveTo(radius * 0.45, -radius * 0.5);
+    ctx.lineTo(radius * 0.45, radius * 0.5);
+    ctx.lineTo(-radius * 0.4, radius * 0.55);
+    ctx.lineTo(-radius * 0.55, 0);
+    ctx.lineTo(-radius * 0.4, -radius * 0.55);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
+
+    // Central Core / Emblem
+    ctx.fillStyle = accentColor;
+    ctx.shadowBlur = 10;
+    ctx.shadowColor = accentColor;
+    ctx.beginPath();
+    ctx.arc(0, 0, 4.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+
+    // D. Tactical Weapons & Arms (Facing Forward +X)
+    ctx.save();
+    // Arm gauntlets gripping firearm
+    ctx.fillStyle = "#1e293b";
+    ctx.strokeStyle = "#334155";
+    ctx.lineWidth = 1.5;
+
+    // Right arm extending to weapon
+    ctx.beginPath();
+    ctx.roundRect(4, 5, 10, 6, 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Left arm stabilizing weapon or secondary
+    ctx.beginPath();
+    ctx.roundRect(2, -10, 8, 5, 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Weapon Type Rendering
+    if (characterSlug === "volt") {
+      // Long Cyber Railgun with Energy Capacitors
+      ctx.fillStyle = "#090d16";
+      ctx.strokeStyle = "#00f5ff";
+      ctx.lineWidth = 1.5;
+      ctx.fillRect(8, 5, 26, 4);
+      ctx.strokeRect(8, 5, 26, 4);
+
+      // Energy capacitor rings
+      ctx.fillStyle = "#00f5ff";
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = "#00f5ff";
+      ctx.fillRect(16, 4, 3, 6);
+      ctx.fillRect(24, 4, 3, 6);
+
+      // Local Aim Laser Line
+      if (player.isLocal) {
+        ctx.strokeStyle = "rgba(0, 245, 255, 0.4)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 6]);
+        ctx.beginPath();
+        ctx.moveTo(34, 7);
+        ctx.lineTo(160, 7);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    } else if (characterSlug === "titan") {
+      // Juggernaut Autocannon + Left Riot Shield
+      ctx.fillStyle = "#052e16";
+      ctx.strokeStyle = "#39ff14";
+      ctx.lineWidth = 2;
+      ctx.fillRect(10, -14, 5, 14);
+      ctx.strokeRect(10, -14, 5, 14);
+
+      // Twin-barrel heavy cannon on right
+      ctx.fillStyle = "#1f2937";
+      ctx.strokeStyle = "#10b981";
+      ctx.lineWidth = 1.5;
+      ctx.fillRect(8, 4, 18, 4);
+      ctx.fillRect(8, 9, 18, 4);
+      ctx.strokeRect(8, 4, 18, 9);
+    } else if (characterSlug === "phantom") {
+      // Dual Stealth Plasma Blades / Silenced Needler
+      ctx.fillStyle = "#9333ea";
+      ctx.shadowBlur = 10;
+      ctx.shadowColor = "#bf5fff";
+      ctx.beginPath();
+      ctx.moveTo(8, -8);
+      ctx.lineTo(24, -12);
+      ctx.lineTo(12, -5);
+      ctx.closePath();
+      ctx.fill();
+
+      // Right silenced firearm
+      ctx.fillStyle = "#18181b";
+      ctx.strokeStyle = "#bf5fff";
+      ctx.lineWidth = 1.2;
+      ctx.fillRect(8, 5, 16, 3.5);
+      ctx.strokeRect(8, 5, 16, 3.5);
+    } else {
+      // Blaze / Default: Heavy Thermal Carbine
+      ctx.fillStyle = "#1c1917";
+      ctx.strokeStyle = "#ff6b00";
+      ctx.lineWidth = 1.5;
+      ctx.fillRect(8, 5, 18, 5.5);
+      ctx.strokeRect(8, 5, 18, 5.5);
+
+      // Heat vent glowing orange
+      ctx.fillStyle = "#ff2d00";
+      ctx.shadowBlur = 8;
+      ctx.shadowColor = "#ff2d00";
+      ctx.fillRect(14, 6.5, 7, 2.5);
+
+      if (player.isLocal) {
+        ctx.strokeStyle = "rgba(255, 107, 0, 0.4)";
+        ctx.lineWidth = 1;
+        ctx.setLineDash([4, 6]);
+        ctx.beginPath();
+        ctx.moveTo(26, 7.5);
+        ctx.lineTo(140, 7.5);
+        ctx.stroke();
+        ctx.setLineDash([]);
+      }
+    }
+
+    // Muzzle Flash Effect (if recently attacked)
+    if (player.primaryCooldown > 0.25 || player.animState === "attack") {
+      ctx.save();
+      const muzzleX = characterSlug === "volt" ? 34 : 26;
+      const muzzleY = 7;
+      ctx.fillStyle = "#ffffff";
+      ctx.shadowBlur = 16;
+      ctx.shadowColor = accentColor || "#ffffff";
+      ctx.beginPath();
+      ctx.arc(muzzleX, muzzleY, 4, 0, Math.PI * 2);
+      ctx.fill();
+
+      // Starburst rays
+      ctx.strokeStyle = accentColor;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(muzzleX - 4, muzzleY);
+      ctx.lineTo(muzzleX + 8, muzzleY);
+      ctx.moveTo(muzzleX + 2, muzzleY - 6);
+      ctx.lineTo(muzzleX + 2, muzzleY + 6);
+      ctx.stroke();
+      ctx.restore();
+    }
+    ctx.restore();
+
+    // E. Combat Helmet & High-Tech Visor
+    ctx.save();
+    // Helmet base
+    ctx.fillStyle = hitFlash > 0 ? "#ffffff" : "#0f172a";
+    ctx.strokeStyle = "#334155";
+    ctx.lineWidth = 1.5;
+    ctx.shadowBlur = 6;
+    ctx.shadowColor = "#000000";
+    ctx.beginPath();
+    ctx.arc(-1, 0, radius * 0.46, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.stroke();
+
+    // Curved Glowing Visor Glass (Front-facing +X)
+    const visorGrad = ctx.createLinearGradient(2, -7, 9, 7);
+    visorGrad.addColorStop(0, "#ffffff");
+    visorGrad.addColorStop(0.35, accentColor || "#00f5ff");
+    visorGrad.addColorStop(1, color || "#0080ff");
+
+    ctx.fillStyle = visorGrad;
+    ctx.shadowBlur = 12;
+    ctx.shadowColor = accentColor || "#00f5ff";
+    ctx.beginPath();
+    ctx.arc(1, 0, radius * 0.42, -Math.PI * 0.38, Math.PI * 0.38);
+    ctx.lineTo(4, 0);
+    ctx.closePath();
+    ctx.fill();
+
+    // Visor specular glass shine highlight
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.85)";
+    ctx.lineWidth = 1.2;
+    ctx.beginPath();
+    ctx.arc(1, 0, radius * 0.4, -Math.PI * 0.28, -Math.PI * 0.05);
+    ctx.stroke();
+    ctx.restore();
+
+    // F. Hexagonal Shield Bubble (Titan buff / Forcefield)
+    if (characterSlug === "titan" && player.secondaryCooldown > 0) {
+      ctx.save();
+      ctx.strokeStyle = "#39ff14";
+      ctx.lineWidth = 2;
+      ctx.shadowBlur = 14;
+      ctx.shadowColor = "#39ff14";
+      ctx.fillStyle = "rgba(57, 255, 20, 0.12)";
+      ctx.beginPath();
+      for (let a = 0; a < 6; a++) {
+        const ang = (a * Math.PI) / 3;
+        const hx = Math.cos(ang) * (radius + 6);
+        const hy = Math.sin(ang) * (radius + 6);
+        if (a === 0) ctx.moveTo(hx, hy);
+        else ctx.lineTo(hx, hy);
+      }
+      ctx.closePath();
+      ctx.fill();
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    ctx.restore(); // Exit translated/rotated coordinate space
+
+    // 4. Tactical Health Bar & Player Name Tag
+    const barW = 54;
     const barH = 5;
     const barX = x - barW / 2;
-    const barY = y - radius - 14;
+    const barY = y - radius - 16;
 
-    ctx.fillStyle = "rgba(0,0,0,0.6)";
+    // Health bar backdrop
+    ctx.fillStyle = "rgba(10, 15, 28, 0.85)";
     ctx.fillRect(barX - 1, barY - 1, barW + 2, barH + 2);
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.15)";
+    ctx.lineWidth = 1;
+    ctx.strokeRect(barX - 1, barY - 1, barW + 2, barH + 2);
 
-    ctx.fillStyle = player.healthPercent > 0.5 ? "#39ff14" : player.healthPercent > 0.25 ? "#ffd700" : "#ff2d78";
-    ctx.fillRect(barX, barY, barW * player.healthPercent, barH);
+    // Health bar fill
+    const hpColor = player.healthPercent > 0.5 ? "#39ff14" : player.healthPercent > 0.25 ? "#ffd700" : "#ff2d78";
+    ctx.fillStyle = hpColor;
+    ctx.shadowBlur = 4;
+    ctx.shadowColor = hpColor;
+    ctx.fillRect(barX, barY, Math.max(0, barW * player.healthPercent), barH);
+    ctx.shadowBlur = 0;
 
-    // Name tag
+    // Player Name & Role Badge
     ctx.save();
-    ctx.fillStyle = player.isLocal ? "#00f5ff" : "#ffffff";
-    ctx.shadowBlur = 6;
-    ctx.shadowColor = player.isLocal ? "#00f5ff" : "#ffffff";
-    ctx.font = "bold 11px 'Orbitron', monospace";
+    ctx.font = "bold 10px 'Orbitron', monospace";
     ctx.textAlign = "center";
-    ctx.fillText(player.username, x, barY - 6);
+
+    if (player.isLocal) {
+      ctx.fillStyle = "#00f5ff";
+      ctx.shadowBlur = 6;
+      ctx.shadowColor = "#00f5ff";
+      ctx.fillText(`[YOU] ${player.username}`, x, barY - 5);
+    } else {
+      ctx.fillStyle = "#e2e8f0";
+      ctx.shadowBlur = 4;
+      ctx.shadowColor = "#000000";
+      const roleTag = characterSlug ? `[${characterSlug.toUpperCase()}] ` : "";
+      ctx.fillText(`${roleTag}${player.username}`, x, barY - 5);
+    }
     ctx.restore();
   }
 
@@ -767,6 +1159,10 @@ export class GameEngine {
 
   getLocalPlayer() {
     return this.localPlayer;
+  }
+
+  getTouchController(): TouchController {
+    return this.touchController;
   }
 
   getPhase() {

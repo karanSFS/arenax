@@ -4,7 +4,7 @@ import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { useSession } from "next-auth/react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Copy, Check, Users, Shield, Swords, Crown, Clock } from "lucide-react";
+import { Copy, Check, Users, Swords, Crown, Clock } from "lucide-react";
 import { Navbar } from "@/components/layout/Navbar";
 import { Button } from "@/components/ui/Button";
 import { Avatar, Badge } from "@/components/ui/index";
@@ -27,12 +27,25 @@ interface Room {
   arena: string;
   status: string;
   maxPlayers: number;
+  matchId?: string;
 }
 
 const arenaNames: Record<string, string> = {
   cyber_grid: "Cyber Grid",
   void_core: "Void Core",
   industrial_zone: "Industrial Zone",
+  outpost: "Outpost",
+  catacombs: "Catacombs",
+  high_tower: "High Tower",
+  pyramid: "Pyramid",
+  lunar_base: "Lunar Base",
+};
+
+const characterNames: Record<string, string> = {
+  blaze: "BLAZE (Melee)",
+  volt: "VOLT (Ranged)",
+  titan: "TITAN (Tank)",
+  phantom: "PHANTOM (Assassin)",
 };
 
 export default function LobbyPage() {
@@ -48,31 +61,39 @@ export default function LobbyPage() {
   const [starting, setStarting] = useState(false);
 
   const userId = (session?.user as { id?: string })?.id || "";
-  const username = (session?.user as { username?: string })?.username || "";
 
-  // Poll room state every 2 seconds
+  // Poll room state every 1 second for fast synchronization
   useEffect(() => {
+    let active = true;
+
     const fetchRoom = async () => {
       try {
         const res = await fetch(`/api/rooms/${roomCode}`);
         const data = await res.json();
-        if (data.success) {
+        if (data.success && active) {
           setRoom(data.data);
           if (data.data.status === "IN_PROGRESS") {
             const me = data.data.players.find((p: RoomPlayer) => p.userId === userId);
-            router.push(`/play/game?mode=PRIVATE_ROOM&character=${me?.characterId || "blaze"}&arena=${data.data.arena}`);
+            const characterSlug = me?.characterId || "blaze";
+            const matchId = data.data.matchId || roomCode;
+            router.push(
+              `/play/game?mode=PRIVATE_ROOM&roomCode=${roomCode}&character=${characterSlug}&arena=${data.data.arena}&matchId=${matchId}`
+            );
           }
         }
       } catch {
         // ignore polling errors
       } finally {
-        setLoading(false);
+        if (active) setLoading(false);
       }
     };
 
     fetchRoom();
-    const interval = setInterval(fetchRoom, 2000);
-    return () => clearInterval(interval);
+    const interval = setInterval(fetchRoom, 1000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
   }, [roomCode, userId, router]);
 
   function copyCode() {
@@ -86,21 +107,37 @@ export default function LobbyPage() {
     if (!room) return;
     setStarting(true);
 
-    const me = room.players.find((p) => p.userId === userId);
-    const characterSlug = me?.characterId || "blaze";
+    try {
+      const res = await fetch(`/api/rooms/${roomCode}/start`, {
+        method: "POST",
+      });
+      const data = await res.json();
+      if (!data.success) {
+        toast.error("Failed to start match", data.error?.message || "Please try again.");
+        setStarting(false);
+        return;
+      }
 
-    // Navigate to game
-    router.push(`/play/game?mode=PRIVATE_ROOM&character=${characterSlug}&arena=${room.arena}`);
+      const me = room.players.find((p) => p.userId === userId);
+      const characterSlug = me?.characterId || "blaze";
+      const matchId = data.data?.matchId || room.matchId || roomCode;
+
+      router.push(
+        `/play/game?mode=PRIVATE_ROOM&roomCode=${roomCode}&character=${characterSlug}&arena=${room.arena}&matchId=${matchId}`
+      );
+    } catch {
+      toast.error("Error", "Could not start match.");
+      setStarting(false);
+    }
   }
 
   const isHost = room?.hostUserId === userId;
-  const allReady = room?.players.length === room?.maxPlayers;
 
   return (
     <div className="min-h-screen bg-dark-900">
       <Navbar />
 
-      <main className="pt-20 pb-12 px-4 max-w-3xl mx-auto">
+      <main className="pt-20 pb-12 px-4 max-w-4xl mx-auto">
         <motion.div
           initial={{ opacity: 0, y: 20 }}
           animate={{ opacity: 1, y: 0 }}
@@ -112,51 +149,58 @@ export default function LobbyPage() {
               Private Room
             </p>
             <div className="flex items-center justify-center gap-4">
-              <h1 className="font-display font-black text-4xl gradient-text tracking-widest">
+              <h1 className="font-display font-black text-4xl sm:text-5xl gradient-text tracking-widest">
                 {roomCode}
               </h1>
               <button
                 onClick={copyCode}
-                className="p-2 rounded-lg glass border border-white/10 text-slate-400 hover:text-neon-cyan transition-colors"
-                aria-label="Copy room code"
+                title="Copy Room Code"
+                className="p-2.5 rounded-xl glass border border-white/10 text-slate-400 hover:text-neon-cyan hover:border-neon-cyan/40 transition-colors"
               >
-                {copied ? <Check size={18} className="text-neon-green" /> : <Copy size={18} />}
+                {copied ? <Check size={20} className="text-neon-green" /> : <Copy size={20} />}
               </button>
             </div>
             <p className="text-slate-500 text-sm mt-2">
-              Share this code with friends to invite them
+              Share this code with up to <span className="text-white font-bold">{room?.maxPlayers || 20}</span> players to join!
             </p>
           </div>
 
-          {/* Room info */}
+          {/* Room metadata card */}
           {room && (
-            <div className="glass rounded-2xl p-4 border border-white/8 flex items-center gap-6 justify-center">
-              <div className="text-center">
-                <p className="text-xs text-slate-500 uppercase tracking-widest font-display">Arena</p>
-                <p className="text-sm font-bold text-neon-cyan font-display mt-1">{arenaNames[room.arena]}</p>
+            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+              <div className="glass rounded-xl p-3.5 border border-white/8 text-center">
+                <p className="text-xs text-slate-500 font-display uppercase tracking-wider">Arena</p>
+                <p className="font-display font-bold text-white mt-1">
+                  {arenaNames[room.arena] || room.arena}
+                </p>
               </div>
-              <div className="w-px h-8 bg-white/10" />
-              <div className="text-center">
-                <p className="text-xs text-slate-500 uppercase tracking-widest font-display">Players</p>
-                <p className="text-sm font-bold text-white font-display mt-1">{room.players.length} / {room.maxPlayers}</p>
+              <div className="glass rounded-xl p-3.5 border border-white/8 text-center">
+                <p className="text-xs text-slate-500 font-display uppercase tracking-wider">Players</p>
+                <p className="font-display font-bold text-neon-cyan mt-1">
+                  {room.players.length} / {room.maxPlayers}
+                </p>
               </div>
-              <div className="w-px h-8 bg-white/10" />
-              <div className="text-center">
-                <p className="text-xs text-slate-500 uppercase tracking-widest font-display">Status</p>
+              <div className="glass rounded-xl p-3.5 border border-white/8 text-center col-span-2 sm:col-span-1">
+                <p className="text-xs text-slate-500 font-display uppercase tracking-wider">Status</p>
                 <Badge variant={room.status === "READY" ? "green" : "cyan"} className="mt-1">
-                  {room.status}
+                  {room.status === "IN_PROGRESS" ? "STARTING..." : room.status}
                 </Badge>
               </div>
             </div>
           )}
 
-          {/* Players */}
-          <div className="glass rounded-2xl border border-white/8 overflow-hidden">
-            <div className="p-4 border-b border-white/8">
-              <h2 className="font-display font-bold text-sm text-slate-400 uppercase tracking-widest flex items-center gap-2">
-                <Users size={16} />
-                PLAYERS IN LOBBY
-              </h2>
+          {/* Player roster */}
+          <div className="glass-medium rounded-2xl border border-white/10 overflow-hidden">
+            <div className="p-4 border-b border-white/8 flex items-center justify-between">
+              <div className="flex items-center gap-2">
+                <Users size={18} className="text-neon-cyan" />
+                <h2 className="font-display font-bold text-white text-base">
+                  Connected Fighters ({room?.players.length ?? 0} / {room?.maxPlayers ?? 20})
+                </h2>
+              </div>
+              <span className="text-xs text-slate-500">
+                {isHost ? "You are Host" : "Waiting for Host to start"}
+              </span>
             </div>
 
             {loading ? (
@@ -164,49 +208,46 @@ export default function LobbyPage() {
                 <div className="w-8 h-8 rounded-full border-2 border-neon-cyan border-t-transparent animate-spin mx-auto" />
               </div>
             ) : (
-              <div className="divide-y divide-white/5">
+              <div className="p-4 grid grid-cols-1 sm:grid-cols-2 gap-3 max-h-[420px] overflow-y-auto">
                 {room?.players.map((player) => (
-                  <AnimatePresence key={player.userId}>
-                    <motion.div
-                      initial={{ opacity: 0, x: -20 }}
-                      animate={{ opacity: 1, x: 0 }}
-                      className="flex items-center gap-4 p-4"
-                    >
-                      <Avatar username={player.username} size="md" />
-                      <div className="flex-1">
-                        <div className="flex items-center gap-2">
-                          <span className="font-bold text-white">{player.username}</span>
-                          {player.isHost && (
-                            <Crown size={14} className="text-yellow-400" />
-                          )}
-                          {player.userId === userId && (
-                            <Badge variant="cyan" className="text-xs">YOU</Badge>
-                          )}
-                        </div>
-                        <p className="text-xs text-slate-500 font-display mt-0.5">
-                          {player.characterId ? `Character: ${player.characterId}` : "Selecting..."}
-                        </p>
+                  <motion.div
+                    key={player.userId}
+                    initial={{ opacity: 0, scale: 0.95 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    className="flex items-center gap-3 p-3 rounded-xl bg-white/[0.03] border border-white/8"
+                  >
+                    <Avatar username={player.username} size="md" />
+                    <div className="flex-1 min-w-0">
+                      <div className="flex items-center gap-2">
+                        <span className="font-bold text-white text-sm truncate">{player.username}</span>
+                        {player.isHost && (
+                          <Crown size={14} className="text-yellow-400 flex-shrink-0" />
+                        )}
+                        {player.userId === userId && (
+                          <Badge variant="cyan" className="text-[10px] py-0 px-1.5 flex-shrink-0">YOU</Badge>
+                        )}
                       </div>
-                      <div className={`w-2.5 h-2.5 rounded-full ${player.isHost || player.isReady ? "bg-neon-green" : "bg-slate-600"}`} />
-                    </motion.div>
-                  </AnimatePresence>
+                      <p className="text-xs text-slate-400 font-display truncate mt-0.5">
+                        {characterNames[player.characterId] || (player.characterId ? player.characterId.toUpperCase() : "Selecting...")}
+                      </p>
+                    </div>
+                    <div className={`w-2.5 h-2.5 rounded-full flex-shrink-0 ${player.isHost || player.isReady ? "bg-neon-green shadow-neon-green" : "bg-slate-600"}`} />
+                  </motion.div>
                 ))}
 
-                {/* Empty slots */}
-                {room && Array.from({ length: room.maxPlayers - room.players.length }).map((_, i) => (
-                  <div key={i} className="flex items-center gap-4 p-4 opacity-30">
-                    <div className="w-10 h-10 rounded-full border-2 border-dashed border-slate-700 flex items-center justify-center">
-                      <Clock size={16} className="text-slate-700" />
-                    </div>
-                    <p className="text-sm text-slate-600 font-display">Waiting for player...</p>
+                {/* Open slot indicators */}
+                {room && room.maxPlayers > room.players.length && (
+                  <div className="col-span-1 sm:col-span-2 flex items-center justify-center p-3 rounded-xl border border-dashed border-white/10 text-slate-500 text-xs font-display">
+                    <Clock size={14} className="mr-2 animate-pulse" />
+                    {room.maxPlayers - room.players.length} open slots remaining — invite friends with code {roomCode}
                   </div>
-                ))}
+                )}
               </div>
             )}
           </div>
 
-          {/* Actions */}
-          <div className="flex gap-3">
+          {/* Action buttons */}
+          <div className="flex flex-col sm:flex-row gap-3">
             {isHost ? (
               <Button
                 variant="neon"
@@ -216,18 +257,19 @@ export default function LobbyPage() {
                 onClick={startGame}
                 rightIcon={<Swords size={18} />}
               >
-                START BATTLE
+                START BATTLE FOR ALL PLAYERS
               </Button>
             ) : (
               <Button variant="secondary" size="lg" fullWidth disabled>
                 <Clock size={16} className="mr-2" />
-                Waiting for host...
+                Waiting for Host to start match...
               </Button>
             )}
             <Button
-              variant="danger"
+              variant="secondary"
               size="lg"
               onClick={() => router.push("/play")}
+              className="sm:w-36"
             >
               LEAVE
             </Button>

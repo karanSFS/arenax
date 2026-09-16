@@ -79,7 +79,15 @@ export type RoomStatus =
 
 export type GameMode = "QUICK_MATCH" | "PRIVATE_ROOM" | "PRACTICE";
 
-export type ArenaId = "cyber_grid" | "void_core" | "industrial_zone";
+export type ArenaId =
+  | "cyber_grid"
+  | "void_core"
+  | "industrial_zone"
+  | "outpost"
+  | "catacombs"
+  | "high_tower"
+  | "pyramid"
+  | "lunar_base";
 
 export interface RoomPlayer {
   userId: string;
@@ -98,6 +106,7 @@ export interface IRoom {
   arena: ArenaId;
   status: RoomStatus;
   maxPlayers: number;
+  matchId?: string;
   createdAt: Date;
   updatedAt: Date;
   startedAt?: Date;

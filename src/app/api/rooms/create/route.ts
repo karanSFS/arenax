@@ -3,7 +3,7 @@ import { auth } from "@/lib/auth";
 import { connectDB } from "@/lib/mongodb";
 import Room from "@/models/Room";
 import Match from "@/models/Match";
-import { CreateRoomSchema, JoinRoomSchema } from "@/lib/validation/schemas";
+import { CreateRoomSchema } from "@/lib/validation/schemas";
 import { generateRoomCode, checkRateLimit } from "@/lib/utils/progression";
 
 // POST /api/rooms/create
@@ -39,7 +39,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const { gameMode, arena = "cyber_grid", maxPlayers = 2, characterId } = parsed.data;
+    const { gameMode, arena = "cyber_grid", maxPlayers = 8, characterId } = parsed.data;
 
     await connectDB();
 
@@ -51,6 +51,15 @@ export async function POST(req: NextRequest) {
       attempts++;
     }
 
+    // Create match record first to obtain matchId
+    const match = await Match.create({
+      roomId: new Room()._id,
+      gameMode,
+      arena,
+      players: [userId],
+      status: "WAITING",
+    });
+
     const room = await Room.create({
       roomCode,
       hostUserId: userId,
@@ -59,16 +68,11 @@ export async function POST(req: NextRequest) {
       arena,
       status: "WAITING",
       maxPlayers,
+      matchId: match._id.toString(),
     });
 
-    // Create match record
-    const match = await Match.create({
-      roomId: room._id,
-      gameMode,
-      arena,
-      players: [userId],
-      status: "WAITING",
-    });
+    match.roomId = room._id;
+    await match.save();
 
     return NextResponse.json(
       { success: true, data: { room, matchId: match._id.toString() } },

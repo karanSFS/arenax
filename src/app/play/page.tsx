@@ -74,6 +74,7 @@ function PlayPageContent() {
   const [hoveredChar, setHoveredChar] = useState<Character | null>(null);
   const [gameMode, setGameMode] = useState<"QUICK_MATCH" | "PRIVATE_ROOM" | "PRACTICE">((preselectedMode as any) || "QUICK_MATCH");
   const [arena, setArena] = useState("cyber_grid");
+  const [maxPlayers, setMaxPlayers] = useState(8);
   const [loading, setLoading] = useState(false);
   const [joinModalOpen, setJoinModalOpen] = useState(false);
   const [joinCode, setJoinCode] = useState("");
@@ -119,6 +120,7 @@ function PlayPageContent() {
           body: JSON.stringify({
             gameMode: "PRIVATE_ROOM",
             arena,
+            maxPlayers,
             characterId: selectedChar._id || selectedChar.slug,
           }),
         });
@@ -397,29 +399,77 @@ function PlayPageContent() {
               </div>
             </div>
 
+            {/* Room Capacity (Private Room only) */}
+            {gameMode === "PRIVATE_ROOM" && (
+              <div className="glass rounded-2xl p-5 border border-white/8">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="font-display font-black text-sm text-slate-400 uppercase tracking-widest">
+                    MAX PLAYERS
+                  </h3>
+                  <span className="text-neon-cyan text-xs font-bold font-display">
+                    Up to 20 Fighters
+                  </span>
+                </div>
+                <div className="grid grid-cols-5 gap-2">
+                  {[4, 8, 12, 16, 20].map((num) => (
+                    <button
+                      key={num}
+                      type="button"
+                      onClick={() => setMaxPlayers(num)}
+                      className="py-2.5 rounded-xl text-center font-display font-bold text-sm transition-all border"
+                      style={{
+                        background: maxPlayers === num ? "#bf5fff20" : "rgba(255,255,255,0.02)",
+                        borderColor: maxPlayers === num ? "#bf5fff" : "rgba(255,255,255,0.08)",
+                        color: maxPlayers === num ? "#bf5fff" : "#94a3b8",
+                      }}
+                    >
+                      {num}
+                    </button>
+                  ))}
+                </div>
+              </div>
+            )}
+
             {/* Arena (for practice/private) */}
             {(gameMode === "PRACTICE" || gameMode === "PRIVATE_ROOM") && (
               <div className="glass rounded-2xl p-5 border border-white/8">
-                <h3 className="font-display font-black text-sm text-slate-400 uppercase tracking-widest mb-3">
-                  ARENA
-                </h3>
-                <div className="grid grid-cols-3 gap-2">
+                <div className="flex items-center justify-between mb-3">
+                  <h3 className="font-display font-black text-sm text-slate-400 uppercase tracking-widest">
+                    ARENA MAP
+                  </h3>
+                  <span className="text-slate-500 text-xs font-display">
+                    Mini Militia Inspired
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   {[
-                    { id: "cyber_grid", label: "Cyber Grid", color: "#00f5ff" },
-                    { id: "void_core", label: "Void Core", color: "#bf5fff" },
-                    { id: "industrial_zone", label: "Industrial", color: "#39ff14" },
+                    { id: "outpost", label: "Outpost", color: "#22c55e", tag: "Jungle" },
+                    { id: "catacombs", label: "Catacombs", color: "#f97316", tag: "Cavern" },
+                    { id: "high_tower", label: "High Tower", color: "#38bdf8", tag: "Vertical" },
+                    { id: "pyramid", label: "Pyramid", color: "#eab308", tag: "Desert" },
+                    { id: "lunar_base", label: "Lunar Base", color: "#a855f7", tag: "Space" },
+                    { id: "cyber_grid", label: "Cyber Grid", color: "#00f5ff", tag: "Neon" },
+                    { id: "void_core", label: "Void Core", color: "#bf5fff", tag: "Rift" },
+                    { id: "industrial_zone", label: "Industrial", color: "#39ff14", tag: "Heavy" },
                   ].map((a) => (
                     <div
                       key={a.id}
                       onClick={() => setArena(a.id)}
-                      className="p-2 rounded-xl cursor-pointer text-center transition-all border text-xs font-display font-bold"
+                      className="p-2.5 rounded-xl cursor-pointer text-center transition-all border flex flex-col items-center justify-center gap-0.5"
                       style={{
-                        background: arena === a.id ? `${a.color}15` : "rgba(255,255,255,0.02)",
-                        borderColor: arena === a.id ? `${a.color}40` : "rgba(255,255,255,0.05)",
-                        color: arena === a.id ? a.color : "#94a3b8",
+                        background: arena === a.id ? `${a.color}18` : "rgba(255,255,255,0.02)",
+                        borderColor: arena === a.id ? `${a.color}50` : "rgba(255,255,255,0.06)",
                       }}
                     >
-                      {a.label}
+                      <span
+                        className="font-display font-bold text-xs"
+                        style={{ color: arena === a.id ? a.color : "#e2e8f0" }}
+                      >
+                        {a.label}
+                      </span>
+                      <span className="text-[10px] text-slate-500 font-display uppercase tracking-wider">
+                        {a.tag}
+                      </span>
                     </div>
                   ))}
                 </div>

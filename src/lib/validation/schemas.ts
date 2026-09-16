@@ -29,8 +29,19 @@ export const UpdateProfileSchema = z.object({
 // ─── Room ─────────────────────────────────────────────────────────────────────
 export const CreateRoomSchema = z.object({
   gameMode: z.enum(["QUICK_MATCH", "PRIVATE_ROOM", "PRACTICE"]),
-  arena: z.enum(["cyber_grid", "void_core", "industrial_zone"]).optional(),
-  maxPlayers: z.number().int().min(2).max(4).optional(),
+  arena: z
+    .enum([
+      "cyber_grid",
+      "void_core",
+      "industrial_zone",
+      "outpost",
+      "catacombs",
+      "high_tower",
+      "pyramid",
+      "lunar_base",
+    ])
+    .optional(),
+  maxPlayers: z.number().int().min(2).max(20).optional(),
   characterId: z.string().min(1, "Character is required"),
 });
 
