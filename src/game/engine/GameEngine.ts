@@ -56,9 +56,10 @@ export interface HUDData {
     deaths: number;
     score: number;
     abilities: {
-      primary: { cooldown: number; max: number };
-      secondary: { cooldown: number; max: number };
-      ultimate: { cooldown: number; max: number };
+      primary: { cooldown: number; max: number; name?: string };
+      secondary: { cooldown: number; max: number; name?: string };
+      tactical?: { cooldown: number; max: number; name?: string };
+      ultimate: { cooldown: number; max: number; name?: string };
     };
   };
   timeRemaining: number;
@@ -279,8 +280,12 @@ export class GameEngine {
     }
 
     // ── Input ────────────────────────────────────────────────
-    const kb = this.keyboard.getState();
+    const localScreenPos = this.localPlayer
+      ? { x: this.localPlayer.x - this.cameraX, y: this.localPlayer.y - this.cameraY }
+      : undefined;
+    const kb = this.keyboard.getState(localScreenPos);
     const touch = this.touchController.getState();
+    const isTouchAim = touch.aimX !== 0 || touch.aimY !== 0;
     const input: InputState = {
       up: kb.up || touch.up,
       down: kb.down || touch.down,
@@ -290,8 +295,9 @@ export class GameEngine {
       ability1: kb.ability1 || touch.ability1,
       ability2: kb.ability2 || touch.ability2,
       ultimate: kb.ultimate || touch.ultimate,
-      aimX: (touch.aimX !== 0 || touch.aimY !== 0) ? touch.aimX : kb.aimX,
-      aimY: (touch.aimX !== 0 || touch.aimY !== 0) ? touch.aimY : kb.aimY,
+      aimX: isTouchAim ? touch.aimX : kb.aimX,
+      aimY: isTouchAim ? touch.aimY : kb.aimY,
+      isMouseAiming: isTouchAim || kb.isMouseAiming,
       sequence: kb.sequence + touch.sequence,
     };
 
@@ -383,6 +389,10 @@ export class GameEngine {
             this.particles.hit(proj.x, proj.y, proj.color, 10);
             this.screenShake = 0.3;
 
+            if (owner.isLocal && !target.isLocal) {
+              this.recordDamageEvent(target.userId || target.id, dmg);
+            }
+
             if (target.isLocal || owner.isLocal) {
               soundManager.playHit();
             }
@@ -437,9 +447,10 @@ export class GameEngine {
           deaths: this.localPlayer.deaths,
           score: this.localPlayer.score,
           abilities: {
-            primary: { cooldown: cds.primary.current, max: cds.primary.max },
-            secondary: { cooldown: cds.secondary.current, max: cds.secondary.max },
-            ultimate: { cooldown: cds.ultimate.current, max: cds.ultimate.max },
+            primary: { cooldown: cds.primary.current, max: cds.primary.max, name: cds.primary.name },
+            secondary: { cooldown: cds.secondary.current, max: cds.secondary.max, name: cds.secondary.name },
+            tactical: { cooldown: cds.tactical.current, max: cds.tactical.max, name: cds.tactical.name },
+            ultimate: { cooldown: cds.ultimate.current, max: cds.ultimate.max, name: cds.ultimate.name },
           },
         },
         timeRemaining: Math.max(0, this.matchTimer),
@@ -449,10 +460,17 @@ export class GameEngine {
     }
   }
 
+  public triggerAbility(action: "attack" | "ability1" | "ability2" | "ultimate") {
+    this.keyboard.triggerAction(action, true);
+    setTimeout(() => {
+      this.keyboard.triggerAction(action, false);
+    }, 120);
+  }
+
   private handleAttackInput(input: InputState) {
     if (!this.localPlayer || !this.localPlayer.isAlive) return;
 
-    // Primary attack
+    // Primary weapon attack (Space / Left Click / On-screen Fire Button)
     if (input.attack) {
       const result = this.localPlayer.activatePrimary();
       if (result?.projectile) {
@@ -464,7 +482,7 @@ export class GameEngine {
       }
     }
 
-    // Ability Q (Dash / Secondary)
+    // Ability Q (Skill 1: Dash / Shield / Vanish)
     if (input.ability1) {
       const result = this.localPlayer.activateSecondary();
       if (result?.projectile) {
@@ -482,19 +500,38 @@ export class GameEngine {
       }
     }
 
-    // Ability E (Ultimate)
+    // Ability E (Skill 2: Tactical Blast / Spread / Stomp)
     if (input.ability2) {
+      const result = this.localPlayer.activateTactical();
+      if (result?.projectiles) {
+        for (const p of result.projectiles) {
+          this.spawnProjectile(p);
+        }
+        soundManager.playAttack(this.localPlayer.characterSlug);
+      } else if (result?.projectile) {
+        this.spawnProjectile(result.projectile);
+        soundManager.playAttack(this.localPlayer.characterSlug);
+      } else if (result?.aoe) {
+        this.processAOE(this.localPlayer, result.aoe.x, result.aoe.y, result.aoe.radius, result.aoe.damage);
+        this.screenShake = 0.45;
+        this.particles.explosion(result.aoe.x, result.aoe.y, this.localPlayer.accentColor, 18);
+        soundManager.playDash();
+      }
+    }
+
+    // Ability R (Ultimate Move: Conflagration / Thunderstrike / Meteor / Death Mark)
+    if (input.ultimate) {
       const result = this.localPlayer.activateUltimate();
       if (result?.projectile) {
         this.spawnProjectile(result.projectile);
-        this.screenShake = 0.5;
+        this.screenShake = 0.6;
         this.particles.explosion(this.localPlayer.x, this.localPlayer.y, this.localPlayer.accentColor, 20);
         soundManager.playUltimate();
       }
       if (result?.aoe) {
         this.processAOE(this.localPlayer, result.aoe.x, result.aoe.y, result.aoe.radius, result.aoe.damage);
-        this.screenShake = 0.8;
-        this.particles.explosion(result.aoe.x, result.aoe.y, this.localPlayer.accentColor, 30);
+        this.screenShake = 0.85;
+        this.particles.explosion(result.aoe.x, result.aoe.y, this.localPlayer.accentColor, 32);
         soundManager.playUltimate();
       }
     }
@@ -512,6 +549,14 @@ export class GameEngine {
         this.addDamageNumber(target.x, target.y - 20, dmg, attacker.color);
         this.particles.hit(target.x, target.y, attacker.color, 8);
         this.screenShake = 0.25;
+
+        if (attacker.isLocal && !target.isLocal) {
+          this.recordDamageEvent(target.userId || target.id, dmg);
+        }
+
+        if (target.isLocal || attacker.isLocal) {
+          soundManager.playHit();
+        }
 
         if (!target.isAlive) {
           this.handleKill(attacker, target);
@@ -534,6 +579,10 @@ export class GameEngine {
         const dmg = target.takeDamage(damage * falloff);
         attacker.damageDealt += dmg;
         this.addDamageNumber(target.x, target.y - 30, dmg, attacker.color);
+
+        if (attacker.isLocal && !target.isLocal) {
+          this.recordDamageEvent(target.userId || target.id, dmg);
+        }
 
         if (!target.isAlive) {
           this.handleKill(attacker, target);
@@ -1199,6 +1248,27 @@ export class GameEngine {
   }
 
   // ─── Public API ────────────────────────────────────────────────────────────
+
+  private pendingDamageEvents: Array<{ targetId: string; damage: number; timestamp: number }> = [];
+
+  recordDamageEvent(targetId: string, damage: number) {
+    this.pendingDamageEvents.push({ targetId, damage, timestamp: Date.now() });
+  }
+
+  getAndClearPendingDamageEvents() {
+    const events = [...this.pendingDamageEvents];
+    this.pendingDamageEvents = [];
+    return events;
+  }
+
+  applyIncomingDamage(damage: number) {
+    if (!this.localPlayer || !this.localPlayer.isAlive) return;
+    this.localPlayer.takeDamage(damage);
+    soundManager.playHit();
+    this.screenShake = 0.4;
+    this.particles.hit(this.localPlayer.x, this.localPlayer.y, "#ff2d78", 12);
+    this.addDamageNumber(this.localPlayer.x, this.localPlayer.y - 20, damage, "#ff2d78");
+  }
 
   destroy() {
     this.isDestroyed = true;

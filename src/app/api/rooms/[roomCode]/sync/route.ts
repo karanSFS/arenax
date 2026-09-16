@@ -65,6 +65,7 @@ export async function POST(
     const callerChar = pData.characterSlug || "blaze";
 
     const now = Date.now();
+    let incomingDamage: Array<{ damage: number; attackerId?: string }> = [];
 
     const playerPayload: PlayerSyncPayload = {
       userId: callerId,
@@ -111,6 +112,38 @@ export async function POST(
           },
           { upsert: true }
         );
+
+        // 2b. Process damage events sent by attacker
+        const damageEvents = Array.isArray(body.damageEvents) ? body.damageEvents : [];
+        if (damageEvents.length > 0) {
+          const dmgCol = db.collection("room_damage");
+          for (const de of damageEvents) {
+            if (de.targetId && typeof de.damage === "number") {
+              await dmgCol.insertOne({
+                roomCode,
+                targetId: de.targetId,
+                attackerId: callerId,
+                damage: de.damage,
+                createdAt: new Date(),
+              });
+            }
+          }
+        }
+
+        // 2c. Fetch any damage inflicted upon this caller
+        const dmgCol = db.collection("room_damage");
+        const incomingDocs = await dmgCol
+          .find({ roomCode, targetId: callerId })
+          .toArray();
+
+        if (incomingDocs.length > 0) {
+          const idsToDelete = incomingDocs.map((d) => d._id);
+          await dmgCol.deleteMany({ _id: { $in: idsToDelete } });
+          incomingDamage = incomingDocs.map((d) => ({
+            damage: d.damage,
+            attackerId: d.attackerId,
+          }));
+        }
 
         // Fetch all active players in this room updated within last 5 seconds
         const activeSince = new Date(Date.now() - 5000);
@@ -166,9 +199,11 @@ export async function POST(
     return NextResponse.json({
       success: true,
       players: otherPlayers,
+      incomingDamage,
       data: {
         timestamp: now,
         players: otherPlayers,
+        incomingDamage,
       },
     });
   } catch (err) {

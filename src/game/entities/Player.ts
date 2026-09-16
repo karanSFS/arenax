@@ -66,6 +66,7 @@ export class Player {
   // Ability cooldowns (in seconds, countdown to 0)
   primaryCooldown = 0;
   secondaryCooldown = 0;
+  tacticalCooldown = 0;
   ultimateCooldown = 0;
 
   // Animations
@@ -79,6 +80,11 @@ export class Player {
   targetX = 0;
   targetY = 0;
   lerpFactor = 0.15;
+
+  // Out-of-combat health regeneration & damage locking
+  timeSinceLastDamage = 0;
+  regenTimer = 0;
+  lastDamageTakenTime = 0;
 
   constructor(data: PlayerData, spawnX: number, spawnY: number) {
     this.id = data.id;
@@ -110,6 +116,7 @@ export class Player {
     // Cooldowns
     this.primaryCooldown = Math.max(0, this.primaryCooldown - dt);
     this.secondaryCooldown = Math.max(0, this.secondaryCooldown - dt);
+    this.tacticalCooldown = Math.max(0, this.tacticalCooldown - dt);
     this.ultimateCooldown = Math.max(0, this.ultimateCooldown - dt);
 
     // Hit flash decay
@@ -150,20 +157,43 @@ export class Player {
     }
 
     if (!collidedX) this.x = newX;
-    if (!collidedY) this.y = newY;
+    else this.vx = 0;
 
-    // Arena bounds
-    this.x = Math.max(this.radius + 30, Math.min(arenaW - this.radius - 30, this.x));
-    this.y = Math.max(this.radius + 30, Math.min(arenaH - this.radius - 30, this.y));
+    if (!collidedY) this.y = newY;
+    else this.vy = 0;
+
+    // Arena boundary clamp
+    this.x = Math.max(this.radius, Math.min(arenaW - this.radius, this.x));
+    this.y = Math.max(this.radius, Math.min(arenaH - this.radius, this.y));
 
     // Friction
-    this.vx *= 0.85;
-    this.vy *= 0.85;
+    this.vx *= 0.88;
+    this.vy *= 0.88;
 
-    // Animation state
-    if (Math.abs(this.vx) > 5 || Math.abs(this.vy) > 5) {
+    // Out-of-combat health regeneration:
+    // If player avoids taking damage for 3.5 seconds, start regenerating 10% max HP per second!
+    if (this.health < this.maxHealth) {
+      this.timeSinceLastDamage += dt;
+      if (this.timeSinceLastDamage >= 3.5) {
+        this.regenTimer += dt;
+        if (this.regenTimer >= 1.0) {
+          this.regenTimer = 0;
+          const healAmount = Math.max(1, Math.round(this.maxHealth * 0.10));
+          this.health = Math.min(this.maxHealth, this.health + healAmount);
+        }
+      }
+    } else {
+      this.timeSinceLastDamage = 0;
+      this.regenTimer = 0;
+    }
+
+    // Anim state
+    const speed = Math.hypot(this.vx, this.vy);
+    if (this.hitFlash > 0.5) {
+      this.animState = "hit";
+    } else if (speed > 15) {
       this.animState = "move";
-    } else if (this.animState === "move") {
+    } else {
       this.animState = "idle";
     }
 
@@ -176,7 +206,21 @@ export class Player {
     this.y += (this.targetY - this.y) * this.lerpFactor;
     this.primaryCooldown = Math.max(0, this.primaryCooldown - dt);
     this.secondaryCooldown = Math.max(0, this.secondaryCooldown - dt);
+    this.tacticalCooldown = Math.max(0, this.tacticalCooldown - dt);
     this.ultimateCooldown = Math.max(0, this.ultimateCooldown - dt);
+
+    // Remote out-of-combat health regeneration
+    if (this.isAlive && this.health < this.maxHealth) {
+      this.timeSinceLastDamage += dt;
+      if (this.timeSinceLastDamage >= 3.5) {
+        this.regenTimer += dt;
+        if (this.regenTimer >= 1.0) {
+          this.regenTimer = 0;
+          const heal = Math.max(1, Math.round(this.maxHealth * 0.10));
+          this.health = Math.min(this.maxHealth, this.health + heal);
+        }
+      }
+    }
   }
 
   setRemoteState(data: {
@@ -197,7 +241,15 @@ export class Player {
     if (data.vx !== undefined) this.vx = data.vx;
     if (data.vy !== undefined) this.vy = data.vy;
     if (data.facing !== undefined) this.facing = data.facing;
-    if (data.health !== undefined) this.health = data.health;
+
+    // Prevent stale incoming sync packets from instantly reviving/healing someone we just hit!
+    if (data.health !== undefined) {
+      if (Date.now() - this.lastDamageTakenTime < 1800) {
+        this.health = Math.min(this.health, data.health);
+      } else {
+        this.health = data.health;
+      }
+    }
     if (data.maxHealth !== undefined) this.maxHealth = data.maxHealth;
     if (data.score !== undefined) this.score = data.score;
     if (data.kills !== undefined) this.kills = data.kills;
@@ -205,7 +257,19 @@ export class Player {
     if (data.isAlive !== undefined) this.isAlive = data.isAlive;
   }
 
-  applyInput(input: { up: boolean; down: boolean; left: boolean; right: boolean; aimX: number; aimY: number }, camX: number, camY: number) {
+  applyInput(
+    input: {
+      up: boolean;
+      down: boolean;
+      left: boolean;
+      right: boolean;
+      aimX: number;
+      aimY: number;
+      isMouseAiming?: boolean;
+    },
+    camX: number,
+    camY: number
+  ) {
     let dx = 0, dy = 0;
     if (input.up) dy -= 1;
     if (input.down) dy += 1;
@@ -213,7 +277,8 @@ export class Player {
     if (input.right) dx += 1;
 
     const len = Math.sqrt(dx * dx + dy * dy);
-    if (len > 0) {
+    const isMoving = len > 0;
+    if (isMoving) {
       dx /= len;
       dy /= len;
       this.vx += dx * this.speed * 0.15;
@@ -227,12 +292,19 @@ export class Player {
       this.vy = (this.vy / spd) * this.speed;
     }
 
-    // Facing angle
+    // Facing angle:
+    // DUAL CONTROL SCHEME:
+    // 1. If mouse is actively aiming, aim precision 360° toward mouse cursor.
+    // 2. If user is moving via Arrow keys or WASD, automatically face in movement direction!
+    // 3. Otherwise retain last facing direction.
     const screenX = this.x - camX;
     const screenY = this.y - camY;
-    if (Math.abs(input.aimX) > 0.001 || Math.abs(input.aimY) > 0.001) {
+
+    if (input.isMouseAiming && (input.aimX !== 0 || input.aimY !== 0)) {
       this.facing = Math.atan2(input.aimY - screenY, input.aimX - screenX);
-    } else if (Math.hypot(this.vx, this.vy) > 10) {
+    } else if (isMoving) {
+      this.facing = Math.atan2(dy, dx);
+    } else if (Math.hypot(this.vx, this.vy) > 15) {
       this.facing = Math.atan2(this.vy, this.vx);
     }
   }
@@ -244,6 +316,9 @@ export class Player {
     this.health = Math.max(0, this.health - actual);
     this.hitFlash = 1;
     this.animState = "hit";
+    this.timeSinceLastDamage = 0; // Reset out-of-combat timer on hit!
+    this.regenTimer = 0;
+    this.lastDamageTakenTime = Date.now();
 
     if (this.health <= 0) {
       this.die();
@@ -277,30 +352,26 @@ export class Player {
     this.primaryCooldown = ability.cooldown;
     this.animState = "attack";
 
-    if (ability.type === "projectile") {
-      const speed = 450;
-      return {
-        projectile: {
-          ownerId: this.id,
-          x: this.x,
-          y: this.y,
-          vx: Math.cos(this.facing) * speed,
-          vy: Math.sin(this.facing) * speed,
-          damage: ability.damage + this.attack * 0.3,
-          radius: 8,
-          life: ability.range / speed,
-          maxLife: ability.range / speed,
-          color: this.accentColor,
-          type: "primary",
-        },
-      };
-    }
+    // All fighters shoot a primary projectile on Space/Click!
+    const speed = this.characterSlug === "volt" ? 540 : this.characterSlug === "titan" ? 420 : 470;
+    const radius = this.characterSlug === "titan" ? 11 : this.characterSlug === "blaze" ? 10 : 8;
+    const spawnDist = this.radius + 8;
 
-    if (ability.type === "melee") {
-      return { damage: ability.damage + this.attack * 0.3 };
-    }
-
-    return null;
+    return {
+      projectile: {
+        ownerId: this.id,
+        x: this.x + Math.cos(this.facing) * spawnDist,
+        y: this.y + Math.sin(this.facing) * spawnDist,
+        vx: Math.cos(this.facing) * speed,
+        vy: Math.sin(this.facing) * speed,
+        damage: ability.damage + this.attack * 0.3,
+        radius,
+        life: (ability.range || 700) / speed,
+        maxLife: (ability.range || 700) / speed,
+        color: this.accentColor || this.color,
+        type: "primary",
+      },
+    };
   }
 
   activateSecondary(): { dash?: { dx: number; dy: number }; shield?: boolean; projectile?: Omit<ProjectileData, "id"> } | null {
@@ -309,42 +380,112 @@ export class Player {
     const ability = char.abilities.secondary;
     this.secondaryCooldown = ability.cooldown;
 
-    if (ability.type === "dash") {
+    if (ability.type === "dash" || this.characterSlug === "volt") {
+      const dashDist = this.characterSlug === "volt" ? 360 : 320;
       return {
         dash: {
-          dx: Math.cos(this.facing) * 300,
-          dy: Math.sin(this.facing) * 300,
+          dx: Math.cos(this.facing) * dashDist,
+          dy: Math.sin(this.facing) * dashDist,
         },
       };
     }
-    if (ability.type === "buff" && this.characterSlug === "phantom") {
+    if (this.characterSlug === "phantom") {
       this.isInvisible = true;
-      this.invisTimer = 3;
+      this.invisTimer = 3.5;
       return { shield: true };
     }
-    if (ability.type === "buff") {
-      // Titan shield - briefly reduce damage taken
+    if (this.characterSlug === "titan" || ability.type === "buff") {
       return { shield: true };
-    }
-    if (ability.type === "projectile") {
-      const speed = 350;
-      return {
-        projectile: {
-          ownerId: this.id,
-          x: this.x,
-          y: this.y,
-          vx: Math.cos(this.facing) * speed,
-          vy: Math.sin(this.facing) * speed,
-          damage: ability.damage + this.attack * 0.5,
-          radius: 12,
-          life: ability.range / speed,
-          maxLife: ability.range / speed,
-          color: this.accentColor,
-          type: "secondary",
-        },
-      };
     }
     return null;
+  }
+
+  activateTactical(): {
+    projectile?: Omit<ProjectileData, "id">;
+    projectiles?: Array<Omit<ProjectileData, "id">>;
+    aoe?: { x: number; y: number; radius: number; damage: number };
+  } | null {
+    if (this.tacticalCooldown > 0 || !this.isAlive) return null;
+    const char = CHARACTER_DATA.find((c) => c.slug === this.characterSlug) || CHARACTER_DATA[0];
+    const ability = char.abilities.tactical || {
+      name: "Tactical",
+      description: "Tactical blast",
+      type: "projectile",
+      damage: 45,
+      range: 650,
+      cooldown: 5,
+    };
+    this.tacticalCooldown = ability.cooldown;
+
+    if (this.characterSlug === "blaze") {
+      // 3-way spread of fiery thermal projectiles
+      const speed = 480;
+      const angles = [this.facing - 0.22, this.facing, this.facing + 0.22];
+      const projs = angles.map((ang) => ({
+        ownerId: this.id,
+        x: this.x + Math.cos(ang) * (this.radius + 8),
+        y: this.y + Math.sin(ang) * (this.radius + 8),
+        vx: Math.cos(ang) * speed,
+        vy: Math.sin(ang) * speed,
+        damage: 26 + this.attack * 0.25,
+        radius: 9,
+        life: 1.1,
+        maxLife: 1.1,
+        color: "#ff4500",
+        type: "secondary" as const,
+      }));
+      return { projectiles: projs };
+    }
+
+    if (this.characterSlug === "phantom") {
+      // Twin shadow shurikens
+      const speed = 560;
+      const angles = [this.facing - 0.12, this.facing + 0.12];
+      const projs = angles.map((ang) => ({
+        ownerId: this.id,
+        x: this.x + Math.cos(ang) * (this.radius + 8),
+        y: this.y + Math.sin(ang) * (this.radius + 8),
+        vx: Math.cos(ang) * speed,
+        vy: Math.sin(ang) * speed,
+        damage: 28 + this.attack * 0.3,
+        radius: 8,
+        life: 1.1,
+        maxLife: 1.1,
+        color: "#d040ff",
+        type: "secondary" as const,
+      }));
+      return { projectiles: projs };
+    }
+
+    if (this.characterSlug === "titan") {
+      // Ground concussion shockwave ring
+      return {
+        aoe: {
+          x: this.x,
+          y: this.y,
+          radius: 150,
+          damage: 48 + this.attack * 0.4,
+        },
+      };
+    }
+
+    // Volt / Default: Arc Shot
+    const speed = 640;
+    return {
+      projectile: {
+        ownerId: this.id,
+        x: this.x + Math.cos(this.facing) * (this.radius + 10),
+        y: this.y + Math.sin(this.facing) * (this.radius + 10),
+        vx: Math.cos(this.facing) * speed,
+        vy: Math.sin(this.facing) * speed,
+        damage: 55 + this.attack * 0.5,
+        radius: 12,
+        life: 1.2,
+        maxLife: 1.2,
+        color: this.accentColor || this.color,
+        type: "secondary",
+      },
+    };
   }
 
   activateUltimate(): { projectile?: Omit<ProjectileData, "id">; aoe?: { x: number; y: number; radius: number; damage: number } } | null {
@@ -353,37 +494,33 @@ export class Player {
     const ability = char.abilities.ultimate;
     this.ultimateCooldown = ability.cooldown;
 
-    if (ability.type === "aoe") {
+    if (ability.type === "aoe" || this.characterSlug === "titan" || this.characterSlug === "blaze" || this.characterSlug === "volt") {
       return {
         aoe: {
-          x: this.x + Math.cos(this.facing) * 100,
-          y: this.y + Math.sin(this.facing) * 100,
-          radius: ability.range,
+          x: this.x + Math.cos(this.facing) * 60,
+          y: this.y + Math.sin(this.facing) * 60,
+          radius: ability.range || 170,
           damage: ability.damage + this.attack,
         },
       };
     }
 
-    if (ability.type === "dash") {
-      const speed = 500;
-      return {
-        projectile: {
-          ownerId: this.id,
-          x: this.x,
-          y: this.y,
-          vx: Math.cos(this.facing) * speed,
-          vy: Math.sin(this.facing) * speed,
-          damage: ability.damage + this.attack * 0.8,
-          radius: 20,
-          life: 1.2,
-          maxLife: 1.2,
-          color: this.accentColor,
-          type: "ultimate",
-        },
-      };
-    }
-
-    return null;
+    const speed = 520;
+    return {
+      projectile: {
+        ownerId: this.id,
+        x: this.x + Math.cos(this.facing) * (this.radius + 10),
+        y: this.y + Math.sin(this.facing) * (this.radius + 10),
+        vx: Math.cos(this.facing) * speed,
+        vy: Math.sin(this.facing) * speed,
+        damage: ability.damage + this.attack * 0.8,
+        radius: 20,
+        life: 1.2,
+        maxLife: 1.2,
+        color: this.accentColor,
+        type: "ultimate",
+      },
+    };
   }
 
   get healthPercent() {
@@ -393,9 +530,10 @@ export class Player {
   getAbilityCooldowns() {
     const char = CHARACTER_DATA.find((c) => c.slug === this.characterSlug) || CHARACTER_DATA[0];
     return {
-      primary: { current: this.primaryCooldown, max: char.abilities.primary.cooldown },
-      secondary: { current: this.secondaryCooldown, max: char.abilities.secondary.cooldown },
-      ultimate: { current: this.ultimateCooldown, max: char.abilities.ultimate.cooldown },
+      primary: { current: this.primaryCooldown, max: char.abilities.primary.cooldown, name: char.abilities.primary.name },
+      secondary: { current: this.secondaryCooldown, max: char.abilities.secondary.cooldown, name: char.abilities.secondary.name },
+      tactical: { current: this.tacticalCooldown, max: (char.abilities.tactical?.cooldown || 5), name: (char.abilities.tactical?.name || "Tactical") },
+      ultimate: { current: this.ultimateCooldown, max: char.abilities.ultimate.cooldown, name: char.abilities.ultimate.name },
     };
   }
 }

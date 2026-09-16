@@ -19,11 +19,13 @@ function HUD({
   characterColor,
   isMuted,
   onToggleMute,
+  onTriggerAbility,
 }: {
   data: HUDData;
   characterColor: string;
   isMuted: boolean;
   onToggleMute: () => void;
+  onTriggerAbility?: (action: "attack" | "ability1" | "ability2" | "ultimate") => void;
 }) {
   const { localPlayer, timeRemaining, killFeed } = data;
   const hpPct = (localPlayer.health / localPlayer.maxHealth) * 100;
@@ -58,25 +60,29 @@ function HUD({
           <div className="glass rounded-xl px-5 py-3 border border-white/10 text-center">
             <div className="flex items-center gap-2">
               <Clock size={14} className="text-slate-400" />
-              <span className="text-xl font-black text-white">
-                {formatDuration(Math.max(0, Math.ceil(timeRemaining)))}
+              <span className="text-xl font-black text-white font-mono">
+                {formatDuration(timeRemaining)}
               </span>
             </div>
+            <p className="text-[10px] text-slate-500 uppercase tracking-wider mt-0.5">
+              {data.phase === "countdown" ? "STARTING IN" : "MATCH TIME"}
+            </p>
           </div>
 
           <button
             type="button"
             onClick={onToggleMute}
+            className="glass rounded-xl p-3 border border-white/10 hover:border-white/30 transition-all pointer-events-auto text-slate-400 hover:text-white"
             title={isMuted ? "Unmute Audio" : "Mute Audio"}
-            className="pointer-events-auto p-3 rounded-xl glass border border-white/10 hover:border-neon-cyan/50 text-slate-300 hover:text-white transition-all shadow-lg active:scale-95"
+            aria-label={isMuted ? "Unmute Audio" : "Mute Audio"}
           >
-            {isMuted ? <VolumeX size={18} className="text-neon-pink" /> : <Volume2 size={18} className="text-neon-cyan" />}
+            {isMuted ? <VolumeX size={18} /> : <Volume2 size={18} className="text-neon-cyan" />}
           </button>
         </div>
 
-        {/* Score */}
-        <div className="glass rounded-xl px-4 py-3 border border-white/10 text-right min-w-[120px]">
-          <p className="text-xs text-slate-400 uppercase tracking-widest">Score</p>
+        {/* Score & Stats */}
+        <div className="glass rounded-xl px-4 py-3 border border-white/10 text-right">
+          <p className="text-[10px] text-slate-400 uppercase tracking-widest">SCORE</p>
           <p className="text-xl font-black" style={{ color: characterColor }}>
             {localPlayer.score}
           </p>
@@ -108,54 +114,109 @@ function HUD({
         </AnimatePresence>
       </div>
 
-      {/* Bottom Abilities */}
-      <div className="absolute bottom-6 left-1/2 -translate-x-1/2">
-        <div className="glass rounded-2xl px-6 py-3 border border-white/10 flex items-center gap-4">
+      {/* Bottom Action / Ability Buttons */}
+      <div className="absolute bottom-6 left-1/2 -translate-x-1/2 pointer-events-auto">
+        <div className="glass rounded-2xl px-5 py-3 border border-white/10 flex items-center gap-3 sm:gap-4 shadow-2xl backdrop-blur-md">
           {[
-            { key: "Q", label: "PRIMARY", cd: data.localPlayer.abilities.primary },
-            { key: "E", label: "SECONDARY", cd: data.localPlayer.abilities.secondary },
-            { key: "R", label: "ULTIMATE", cd: data.localPlayer.abilities.ultimate },
-          ].map(({ key, label, cd }) => {
+            {
+              key: "SPACE",
+              label: "ATTACK",
+              name: data.localPlayer.abilities.primary.name || "FIRE",
+              cd: data.localPlayer.abilities.primary,
+              action: "attack" as const,
+              isUlt: false,
+            },
+            {
+              key: "Q",
+              label: "SKILL 1",
+              name: data.localPlayer.abilities.secondary.name || "DASH",
+              cd: data.localPlayer.abilities.secondary,
+              action: "ability1" as const,
+              isUlt: false,
+            },
+            {
+              key: "E",
+              label: "SKILL 2",
+              name: data.localPlayer.abilities.tactical?.name || "BURST",
+              cd: data.localPlayer.abilities.tactical || { cooldown: 0, max: 5 },
+              action: "ability2" as const,
+              isUlt: false,
+            },
+            {
+              key: "R",
+              label: "ULTIMATE",
+              name: data.localPlayer.abilities.ultimate.name || "ULTIMATE",
+              cd: data.localPlayer.abilities.ultimate,
+              action: "ultimate" as const,
+              isUlt: true,
+            },
+          ].map(({ key, label, name, cd, action, isUlt }) => {
             const onCD = cd.cooldown > 0;
-            const pct = onCD ? ((cd.max - cd.cooldown) / cd.max) * 100 : 100;
+            const pct = onCD && cd.max > 0 ? ((cd.max - cd.cooldown) / cd.max) * 100 : 100;
             return (
-              <div key={key} className="text-center">
+              <button
+                key={key}
+                type="button"
+                onClick={() => onTriggerAbility?.(action)}
+                title={`${name} [${key}] - Click or press ${key} to activate`}
+                className="text-center group focus:outline-none transition-transform active:scale-90"
+              >
                 <div
-                  className={`w-14 h-14 rounded-xl border-2 flex items-center justify-center font-display font-black text-lg relative overflow-hidden transition-all ${
+                  className={`w-14 h-14 sm:w-16 sm:h-16 rounded-xl border-2 flex flex-col items-center justify-center font-display relative overflow-hidden transition-all shadow-lg ${
                     onCD
-                      ? "border-white/10 text-slate-600"
-                      : "border-neon-cyan/50 text-neon-cyan"
+                      ? "border-white/10 text-slate-500 bg-white/[0.02]"
+                      : isUlt
+                      ? "border-pink-500/80 text-pink-300 shadow-[0_0_15px_rgba(255,45,120,0.35)] animate-pulse"
+                      : "border-neon-cyan/60 text-neon-cyan hover:border-neon-cyan hover:shadow-[0_0_12px_rgba(0,245,255,0.4)]"
                   }`}
                   style={{
                     background: onCD
-                      ? "rgba(255,255,255,0.03)"
-                      : `${characterColor}15`,
+                      ? "rgba(255,255,255,0.02)"
+                      : isUlt
+                      ? "rgba(255,45,120,0.12)"
+                      : `${characterColor}18`,
                   }}
                 >
+                  {/* Cooldown sweep overlay */}
+                  {onCD && (
+                    <div className="absolute inset-0 bg-black/60 pointer-events-none" />
+                  )}
                   {onCD && (
                     <div
-                      className="absolute bottom-0 left-0 right-0 bg-white/5"
+                      className="absolute bottom-0 left-0 right-0 bg-white/10 pointer-events-none"
                       style={{ height: `${pct}%` }}
                     />
                   )}
-                  <span className="relative z-10">{key}</span>
-                  {onCD && (
-                    <span className="absolute bottom-1 text-[9px] font-bold text-slate-500">
+
+                  {/* Key badge */}
+                  <span className={`relative z-10 font-black tracking-wider ${key === "SPACE" ? "text-xs font-mono" : "text-base"}`}>
+                    {key}
+                  </span>
+
+                  {/* Cooldown text or Name */}
+                  {onCD ? (
+                    <span className="relative z-10 text-[9px] font-mono font-bold text-amber-300">
                       {cd.cooldown.toFixed(1)}s
+                    </span>
+                  ) : (
+                    <span className="relative z-10 text-[8px] font-mono tracking-tight text-white/70 truncate max-w-[54px]">
+                      {name}
                     </span>
                   )}
                 </div>
-                <p className="text-[9px] text-slate-600 mt-1 uppercase tracking-wider">{label}</p>
-              </div>
+                <p className="text-[9px] text-slate-400 mt-1 uppercase font-bold tracking-wider group-hover:text-white transition-colors">
+                  {label}
+                </p>
+              </button>
             );
           })}
         </div>
       </div>
 
       {/* Controls hint (bottom left) */}
-      <div className="absolute bottom-6 left-4">
-        <div className="glass rounded-xl px-3 py-2 border border-white/8 text-xs text-slate-600 font-display">
-          <p>WASD Move · Click Attack · Q/E Ability · R Ultimate</p>
+      <div className="absolute bottom-6 left-4 pointer-events-none">
+        <div className="glass rounded-xl px-3 py-2 border border-white/8 text-xs text-slate-400 font-display">
+          <p>Arrow Keys or WASD: Move & Auto-Aim · Space / Left-Click: Attack · Q/E: Skills · R: Ultimate</p>
         </div>
       </div>
     </div>
@@ -370,6 +431,8 @@ function GamePageContent() {
             const localState = engine.getLocalPlayerState();
             if (!localState) return;
 
+            const damageEvents = engine.getAndClearPendingDamageEvents();
+
             const res = await fetch(`/api/rooms/${roomCode}/sync`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
@@ -381,11 +444,24 @@ function GamePageContent() {
                   username,
                   characterSlug: cleanCharacterSlug,
                 },
+                damageEvents,
               }),
             });
 
             if (res.ok) {
               const data = await res.json();
+
+              // Apply authoritative incoming damage inflicted by other players
+              const incoming = data.incomingDamage || data.data?.incomingDamage;
+              if (Array.isArray(incoming)) {
+                for (const inc of incoming) {
+                  if (typeof inc.damage === "number") {
+                    engine.applyIncomingDamage(inc.damage);
+                  }
+                }
+              }
+
+              // Update positions and states of remote fighters
               const playersList = data.players || data.data?.players;
               if (Array.isArray(playersList)) {
                 for (const p of playersList) {
@@ -488,6 +564,7 @@ function GamePageContent() {
           characterColor={characterColor}
           isMuted={isMuted}
           onToggleMute={handleToggleMute}
+          onTriggerAbility={(action) => engineRef.current?.triggerAbility(action)}
         />
       )}
 

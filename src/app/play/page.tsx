@@ -21,6 +21,7 @@ interface Character {
   abilities: {
     primary: { name: string; description: string };
     secondary: { name: string; description: string };
+    tactical?: { name: string; description: string };
     ultimate: { name: string; description: string };
   };
   color: string;
@@ -333,8 +334,9 @@ function PlayPageContent() {
                   <div className="space-y-2">
                     <h4 className="text-xs font-display font-bold text-slate-500 uppercase tracking-widest">Abilities</h4>
                     {[
-                      { key: "Q", ability: displayChar.abilities.primary, label: "PRIMARY" },
-                      { key: "E", ability: displayChar.abilities.secondary, label: "SECONDARY" },
+                      { key: "SPACE", ability: displayChar.abilities.primary, label: "ATTACK" },
+                      { key: "Q", ability: displayChar.abilities.secondary, label: "SKILL 1" },
+                      ...(displayChar.abilities.tactical ? [{ key: "E", ability: displayChar.abilities.tactical, label: "SKILL 2" }] : []),
                       { key: "R", ability: displayChar.abilities.ultimate, label: "ULTIMATE" },
                     ].map(({ key, ability, label }) => (
                       <div
