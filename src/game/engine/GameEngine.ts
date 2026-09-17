@@ -10,78 +10,8 @@ import { KeyboardController, TouchController, InputState } from "@/game/input/In
 import { ARENAS, ArenaConfig } from "@/game/maps/Arena";
 import { soundManager } from "@/game/audio/SoundManager";
 
-// ─── Swept Collision Utilities ────────────────────────────────────────────────
-// Returns parametric t ∈ [0, 1] of the first intersection, or null.
-// t=0 = start of segment, t=1 = end. First-hit-wins: compare t values.
-
-/**
- * Swept segment vs axis-aligned bounding box (expanded by radius r).
- * Finds the first t along (ax,ay)→(bx,by) where a circle of radius r enters the AABB.
- */
-function sweepSegmentVsAABB(
-  ax: number, ay: number, bx: number, by: number, r: number,
-  wx: number, wy: number, ww: number, wh: number
-): number | null {
-  // Expand AABB by r on all sides (Minkowski sum for circle vs AABB)
-  const minX = wx - r, maxX = wx + ww + r;
-  const minY = wy - r, maxY = wy + wh + r;
-
-  const dx = bx - ax, dy = by - ay;
-  let tMin = 0, tMax = 1;
-
-  // Check X slab
-  if (Math.abs(dx) < 1e-9) {
-    if (ax < minX || ax > maxX) return null;
-  } else {
-    const t1 = (minX - ax) / dx;
-    const t2 = (maxX - ax) / dx;
-    tMin = Math.max(tMin, Math.min(t1, t2));
-    tMax = Math.min(tMax, Math.max(t1, t2));
-    if (tMin > tMax) return null;
-  }
-
-  // Check Y slab
-  if (Math.abs(dy) < 1e-9) {
-    if (ay < minY || ay > maxY) return null;
-  } else {
-    const t1 = (minY - ay) / dy;
-    const t2 = (maxY - ay) / dy;
-    tMin = Math.max(tMin, Math.min(t1, t2));
-    tMax = Math.min(tMax, Math.max(t1, t2));
-    if (tMin > tMax) return null;
-  }
-
-  return tMin >= 0 && tMin <= 1 ? tMin : null;
-}
-
-/**
- * Swept segment vs circle. Returns first t where the point on the segment
- * is within combinedRadius of the circle center.
- */
-function sweepSegmentVsCircle(
-  ax: number, ay: number, bx: number, by: number,
-  cx: number, cy: number, combinedRadius: number
-): number | null {
-  const dx = bx - ax, dy = by - ay;
-  const fx = ax - cx, fy = ay - cy;
-  const r = combinedRadius;
-
-  const a = dx * dx + dy * dy;
-  const b = 2 * (fx * dx + fy * dy);
-  const c = fx * fx + fy * fy - r * r;
-
-  // Already overlapping at start: report t=0
-  if (c < 0) return 0;
-  if (a < 1e-9) return null; // Zero-length segment
-
-  const disc = b * b - 4 * a * c;
-  if (disc < 0) return null;
-
-  const sqrtDisc = Math.sqrt(disc);
-  const t = (-b - sqrtDisc) / (2 * a);
-
-  return t >= 0 && t <= 1 ? t : null;
-}
+import { sweepSegmentVsAABB, sweepSegmentVsCircle } from "@/game/physics/sweptCollision";
+import { ClientInputPacket } from "@/game/server/ServerGameRoom";
 
 
 
@@ -174,11 +104,34 @@ export class GameEngine {
   private damageNumbers: DamageNumber[] = [];
   private killFeed: KillFeed[] = [];
 
-  // Multiplayer real-time sync queues
-  private pendingProjectilesToSync: Array<any> = [];
-  private seenRemoteProjectileIds: Set<string> = new Set();
+  // Multiplayer authoritative sync & prediction
+  public isMultiplayer = false;
+  private inputSeq = 0;
+  private pendingInputsToSync: ClientInputPacket[] = [];
+  private unacknowledgedInputs: Array<{
+    packet: ClientInputPacket;
+    predictedX: number;
+    predictedY: number;
+    predictedVx: number;
+    predictedVy: number;
+  }> = [];
+  private serverTick = 0;
+  private currentPing = 0;
+  private seenEventIds: Set<string> = new Set();
   private lastRemoteActionTimestamps: Map<string, number> = new Map();
-  private pendingLocalAction: any = null;
+  private seenRemoteProjectileIds: Set<string> = new Set();
+
+  // Debug overlay (F3 or ` / ~)
+  public isDebugOverlay = false;
+  private fpsRolling: number[] = [];
+  private lastFpsTime = performance.now();
+  private currentFPS = 60;
+
+  // Event handlers for clean teardown
+  private keydownHandler?: (e: KeyboardEvent) => void;
+  private mousedownHandler?: (e: MouseEvent) => void;
+  private mouseupHandler?: (e: MouseEvent) => void;
+  private contextmenuHandler?: (e: MouseEvent) => void;
 
   // RAF handle
   private rafHandle = 0;
@@ -205,11 +158,21 @@ export class GameEngine {
     this.keyboard = new KeyboardController(canvas);
 
     // Mouse click attack
-    canvas.addEventListener("mousedown", () => this.keyboard.setMouseClick(true));
-    canvas.addEventListener("mouseup", () => this.keyboard.setMouseClick(false));
+    this.mousedownHandler = () => this.keyboard.setMouseClick(true);
+    this.mouseupHandler = () => this.keyboard.setMouseClick(false);
+    this.contextmenuHandler = (e) => e.preventDefault();
 
-    // Prevent context menu
-    canvas.addEventListener("contextmenu", (e) => e.preventDefault());
+    canvas.addEventListener("mousedown", this.mousedownHandler);
+    canvas.addEventListener("mouseup", this.mouseupHandler);
+    canvas.addEventListener("contextmenu", this.contextmenuHandler);
+
+    // Development Debug Mode Toggle (F3 or ` / ~)
+    this.keydownHandler = (e: KeyboardEvent) => {
+      if (e.key === "F3" || e.key === "`" || e.key === "~") {
+        this.isDebugOverlay = !this.isDebugOverlay;
+      }
+    };
+    window.addEventListener("keydown", this.keydownHandler);
   }
 
   // ─── Setup ─────────────────────────────────────────────────────────────────
@@ -329,50 +292,251 @@ export class GameEngine {
     }
   }
 
-  public getAndClearPendingProjectiles(): any[] {
-    const projs = [...this.pendingProjectilesToSync];
-    this.pendingProjectilesToSync = [];
-    return projs;
+  public getAndClearPendingInputs(): ClientInputPacket[] {
+    const list = [...this.pendingInputsToSync];
+    this.pendingInputsToSync = [];
+    return list;
   }
 
-  triggerRemoteAction(id: string, action: { type: string; data?: any }) {
-    const player = this.remotePlayers.get(id);
-    if (!player) return;
+  public setPing(pingMs: number) {
+    this.currentPing = pingMs;
+  }
 
-    if (action.type === "primary") {
-      const res = player.activatePrimary();
-      if (res?.projectile) this.spawnProjectile(res.projectile);
-    } else if (action.type === "secondary") {
-      const res = player.activateSecondary();
-      if (res?.projectile) this.spawnProjectile(res.projectile);
-    } else if (action.type === "ultimate") {
-      const res = player.activateUltimate();
-      if (res?.projectile) this.spawnProjectile(res.projectile);
-      if (res?.aoe) this.processAOE(player, res.aoe.x, res.aoe.y, res.aoe.radius, res.aoe.damage);
+  public getServerTick(): number {
+    return this.serverTick;
+  }
+
+  public setMultiplayer(isMulti: boolean) {
+    this.isMultiplayer = isMulti;
+  }
+
+  public reconcileServerState(serverPlayer: any, lastProcessedInputSeq: number) {
+    if (!this.localPlayer || !serverPlayer) return;
+
+    // Prune acknowledged inputs
+    this.unacknowledgedInputs = this.unacknowledgedInputs.filter(
+      (item) => item.packet.seq > lastProcessedInputSeq
+    );
+
+    // Sync authoritative stats
+    this.localPlayer.health = serverPlayer.health;
+    this.localPlayer.maxHealth = serverPlayer.maxHealth;
+    this.localPlayer.score = serverPlayer.score;
+    this.localPlayer.kills = serverPlayer.kills;
+    this.localPlayer.deaths = serverPlayer.deaths;
+    this.localPlayer.isAlive = serverPlayer.isAlive;
+    if (serverPlayer.shield !== undefined) {
+      this.localPlayer.shield = serverPlayer.shield;
+    }
+
+    // Check discrepancy with authoritative position
+    const errX = serverPlayer.x - this.localPlayer.x;
+    const errY = serverPlayer.y - this.localPlayer.y;
+    const errDist = Math.hypot(errX, errY);
+
+    // If server correction is needed (> 3px error):
+    // Replay unacknowledged inputs on top of authoritative server state!
+    if (errDist > 3) {
+      this.localPlayer.x = serverPlayer.x;
+      this.localPlayer.y = serverPlayer.y;
+      this.localPlayer.vx = serverPlayer.vx;
+      this.localPlayer.vy = serverPlayer.vy;
+
+      for (const item of this.unacknowledgedInputs) {
+        this.localPlayer.applyInput(
+          {
+            up: item.packet.up,
+            down: item.packet.down,
+            left: item.packet.left,
+            right: item.packet.right,
+            aimX: item.packet.worldAimX - this.cameraX,
+            aimY: item.packet.worldAimY - this.cameraY,
+            isMouseAiming: item.packet.isMouseAiming,
+            worldAimX: item.packet.worldAimX,
+            worldAimY: item.packet.worldAimY,
+          } as any,
+          this.cameraX,
+          this.cameraY
+        );
+        this.localPlayer.update(
+          item.packet.dt || 0.016,
+          this.arena.walls,
+          this.arena.width,
+          this.arena.height
+        );
+      }
     }
   }
 
-  getLocalPlayerState() {
-    if (!this.localPlayer) return null;
-    const action = this.pendingLocalAction;
-    this.pendingLocalAction = null;
-    return {
-      userId: this.localPlayer.userId,
-      username: this.localPlayer.username,
-      characterSlug: this.localPlayer.characterSlug,
-      x: Math.round(this.localPlayer.x),
-      y: Math.round(this.localPlayer.y),
-      vx: Math.round(this.localPlayer.vx),
-      vy: Math.round(this.localPlayer.vy),
-      facing: parseFloat(this.localPlayer.facing.toFixed(3)),
-      health: Math.round(this.localPlayer.health),
-      maxHealth: this.localPlayer.maxHealth,
-      score: this.localPlayer.score,
-      kills: this.localPlayer.kills,
-      deaths: this.localPlayer.deaths,
-      isAlive: this.localPlayer.isAlive,
-      action,
-    };
+  public ingestServerSnapshot(snapshot: any) {
+    if (!snapshot) return;
+
+    if (typeof snapshot.serverTick === "number") {
+      this.serverTick = snapshot.serverTick;
+    }
+
+    // 1. Reconcile local player
+    const localData = snapshot.localPlayer || snapshot.data?.localPlayer;
+    const lastSeq =
+      snapshot.lastProcessedInputSeq || snapshot.data?.lastProcessedInputSeq || 0;
+    if (localData) {
+      this.reconcileServerState(localData, lastSeq);
+    }
+
+    // 2. Buffer snapshots for remote players
+    const playersList = snapshot.players || snapshot.data?.players;
+    const now = Date.now();
+    if (Array.isArray(playersList)) {
+      for (const p of playersList) {
+        const pid = p.userId || p.id;
+        if (
+          !pid ||
+          (this.localPlayer &&
+            (pid === this.localPlayer.userId || pid === this.localPlayer.id))
+        ) {
+          continue;
+        }
+
+        let rp = this.remotePlayers.get(pid);
+        if (!rp) {
+          this.addRemotePlayer(
+            pid,
+            p.userId || pid,
+            p.username,
+            p.characterSlug,
+            p.x,
+            p.y
+          );
+          rp = this.remotePlayers.get(pid);
+        }
+
+        if (rp) {
+          rp.pushRemoteSnapshot({
+            tick: snapshot.serverTick || 0,
+            time: now,
+            x: p.x,
+            y: p.y,
+            vx: p.vx,
+            vy: p.vy,
+            facing: p.facing,
+            health: p.health,
+            maxHealth: p.maxHealth,
+            isAlive: p.isAlive,
+            shield: !!p.shield,
+            animState: p.animState || "idle",
+          });
+        }
+      }
+    }
+
+    // 3. Process Authoritative Events (damage numbers, sparks, kills, actions)
+    const events = snapshot.events || snapshot.data?.events;
+    if (Array.isArray(events)) {
+      for (const ev of events) {
+        if (!ev || !ev.id || this.seenEventIds.has(ev.id)) continue;
+        this.seenEventIds.add(ev.id);
+
+        if (ev.type === "damage") {
+          this.addDamageNumber(ev.x, ev.y, ev.damage, ev.color || "#ff2d55");
+          this.particles.hit(ev.x, ev.y, ev.color || "#ff2d55", 10);
+          if (
+            this.localPlayer &&
+            (ev.targetId === this.localPlayer.userId ||
+              ev.sourceId === this.localPlayer.userId)
+          ) {
+            soundManager.playHit();
+            this.screenShake = 0.3;
+          }
+        } else if (ev.type === "wall_hit") {
+          this.particles.sparks(ev.x, ev.y, ev.color || "#4c8dff", 6);
+        } else if (ev.type === "kill") {
+          const killer = this.getPlayerById(ev.sourceId);
+          const victim = this.getPlayerById(ev.targetId);
+          if (killer && victim) {
+            this.handleKill(killer, victim);
+          }
+        } else if (ev.type === "action") {
+          const p = this.getPlayerById(ev.sourceId);
+          if (p && !p.isLocal) {
+            if (ev.actionType === "dash") {
+              this.particles.explosion(p.x, p.y, p.accentColor, 14);
+              soundManager.playDash();
+            } else if (ev.actionType === "shield") {
+              soundManager.playShield();
+            } else if (ev.actionType === "ultimate") {
+              this.particles.explosion(ev.x, ev.y, p.accentColor, 30);
+              this.screenShake = 0.65;
+              soundManager.playUltimate();
+            }
+          }
+        }
+      }
+
+      if (this.seenEventIds.size > 1000) {
+        this.seenEventIds.clear();
+      }
+    }
+
+    // 4. Authoritative Projectiles Sync
+    const projectilesList = snapshot.projectiles || snapshot.data?.projectiles;
+    if (Array.isArray(projectilesList)) {
+      this.syncServerProjectiles(projectilesList);
+    }
+
+    // 5. Remove disconnected players
+    const disconnected =
+      snapshot.disconnectedPlayers || snapshot.data?.disconnectedPlayers;
+    if (Array.isArray(disconnected)) {
+      for (const pid of disconnected) {
+        if (pid !== this.localPlayer?.userId) {
+          this.removeRemotePlayer(pid);
+        }
+      }
+    }
+  }
+
+  private syncServerProjectiles(serverProjs: any[]) {
+    const activeIds = new Set<string>();
+    for (const p of serverProjs) {
+      if (!p || !p.id) continue;
+      activeIds.add(p.id);
+
+      const existing = this.projectiles.get(p.id);
+      if (!existing) {
+        this.projectiles.set(p.id, {
+          id: p.id,
+          ownerId: p.ownerId,
+          x: p.x,
+          y: p.y,
+          vx: p.vx,
+          vy: p.vy,
+          damage: p.damage,
+          radius: p.radius || 8,
+          life: p.life,
+          maxLife: p.maxLife || p.life,
+          color: p.color || "#4c8dff",
+          type: (p.type || "primary") as any,
+        });
+        if (p.ownerId !== this.localPlayer?.userId) {
+          const owner = this.getPlayerById(p.ownerId);
+          soundManager.playAttack(owner?.characterSlug || "volt");
+        }
+      } else {
+        existing.x = p.x;
+        existing.y = p.y;
+        existing.vx = p.vx;
+        existing.vy = p.vy;
+        existing.life = p.life;
+      }
+    }
+
+    if (this.isMultiplayer) {
+      for (const [id, proj] of this.projectiles) {
+        if (proj.ownerId !== this.localPlayer?.userId && !activeIds.has(id)) {
+          this.projectiles.delete(id);
+        }
+      }
+    }
   }
 
   // ─── Game Loop ─────────────────────────────────────────────────────────────
@@ -388,6 +552,18 @@ export class GameEngine {
     this.rafHandle = requestAnimationFrame((time) => {
       const dt = Math.min((time - this.lastTime) / 1000, 0.05); // cap delta
       this.lastTime = time;
+
+      // Calculate rolling FPS for debug overlay
+      const now = performance.now();
+      const frameDelta = (now - this.lastFpsTime) / 1000;
+      this.lastFpsTime = now;
+      if (frameDelta > 0) {
+        this.fpsRolling.push(1 / frameDelta);
+        if (this.fpsRolling.length > 30) this.fpsRolling.shift();
+        this.currentFPS = Math.round(
+          this.fpsRolling.reduce((a, b) => a + b, 0) / this.fpsRolling.length
+        );
+      }
 
       this.update(dt);
       this.render();
@@ -449,9 +625,64 @@ export class GameEngine {
     // ── Local player ─────────────────────────────────────────
     if (this.localPlayer) {
       if (this.localPlayer.isAlive) {
-        this.localPlayer.applyInput(input, this.cameraX, this.cameraY);
+        // Explicit WORLD coordinates for physics and aiming (independent of camera drift)
+        const worldAimX = input.aimX + this.cameraX;
+        const worldAimY = input.aimY + this.cameraY;
+
+        this.localPlayer.applyInput(
+          {
+            ...input,
+            worldAimX,
+            worldAimY,
+          } as any,
+          this.cameraX,
+          this.cameraY
+        );
+
+        let currentAction: ClientInputPacket["action"] = undefined;
+        if (input.attack) {
+          currentAction = { type: "primary", timestamp: Date.now() };
+        } else if (input.ability1) {
+          currentAction = { type: "secondary", timestamp: Date.now() };
+        } else if (input.ability2) {
+          currentAction = { type: "tactical", timestamp: Date.now() };
+        } else if (input.ultimate) {
+          currentAction = { type: "ultimate", timestamp: Date.now() };
+        }
+
         this.handleAttackInput(input);
-      } else if (this.localPlayer.respawnTimer <= 0) {
+
+        // Queue input packet for server synchronization & local reconciliation
+        if (this.isMultiplayer) {
+          const seq = ++this.inputSeq;
+          const packet: ClientInputPacket = {
+            seq,
+            up: input.up,
+            down: input.down,
+            left: input.left,
+            right: input.right,
+            worldAimX,
+            worldAimY,
+            facing: this.localPlayer.facing,
+            isMouseAiming: input.isMouseAiming,
+            action: currentAction,
+            dt,
+          };
+
+          this.pendingInputsToSync.push(packet);
+          this.unacknowledgedInputs.push({
+            packet,
+            predictedX: this.localPlayer.x,
+            predictedY: this.localPlayer.y,
+            predictedVx: this.localPlayer.vx,
+            predictedVy: this.localPlayer.vy,
+          });
+
+          if (this.unacknowledgedInputs.length > 120) {
+            this.unacknowledgedInputs.shift();
+          }
+        }
+      } else if (this.localPlayer.respawnTimer <= 0 && !this.isMultiplayer) {
         const spawn = this.arena.spawnPoints[0];
         this.localPlayer.respawn(spawn.x + (Math.random() - 0.5) * 80, spawn.y + (Math.random() - 0.5) * 80);
         this.particles.healEffect(this.localPlayer.x, this.localPlayer.y);
@@ -480,12 +711,13 @@ export class GameEngine {
       }
     }
 
-    // ── Remote players ────────────────────────────────────────
+    // ── Remote players (Snapshot Interpolation) ────────────────
+    const renderTime = Date.now() - 100; // 100ms interpolation buffer
     for (const rp of this.remotePlayers.values()) {
-      rp.updateRemote(dt);
+      rp.updateRemote(dt, renderTime);
     }
 
-    // ── Projectiles (Swept-Circle Collision — prevents tunneling) ────────────
+    // ── Projectiles (Continuous Swept-Circle Collision — prevents tunneling) ─
     for (const [pid, proj] of this.projectiles) {
       // Save previous position before integration
       const prevX = proj.x;
@@ -501,8 +733,7 @@ export class GameEngine {
         continue;
       }
 
-      // ── First-collision-wins: collect all potential hits with parametric t ──
-      // t=0 means start of segment (prevX,prevY), t=1 means end (proj.x,proj.y)
+      // First-collision-wins: collect all potential hits with parametric t
       type HitCandidate = { t: number; type: "wall" | "player"; target?: Player };
       const hits: HitCandidate[] = [];
 
@@ -515,27 +746,25 @@ export class GameEngine {
         if (t !== null) hits.push({ t, type: "wall" });
       }
 
-      // Player swept collision (segment vs circle)
-      const targets = [
-        ...(this.localPlayer ? [this.localPlayer] : []),
-        ...this.bots,
-        ...Array.from(this.remotePlayers.values()),
-      ];
-      for (const target of targets) {
-        if (target.id === proj.ownerId || target.userId === proj.ownerId || !target.isAlive) continue;
-        // In PRIVATE_ROOM: remote projectiles do NOT directly damage local player
-        // (health authoritative via state sync). Only apply local/bot damage locally.
-        if (target.isLocal && !this.getPlayerById(proj.ownerId)?.isLocal && this.remotePlayers.size > 0) continue;
-        const t = sweepSegmentVsCircle(
-          prevX, prevY, proj.x, proj.y,
-          target.x, target.y, target.radius + proj.radius
-        );
-        if (t !== null) hits.push({ t, type: "player", target });
+      // Player swept collision (local / bot practice mode only; in multiplayer, damage is server-authoritative)
+      if (!this.isMultiplayer) {
+        const targets = [
+          ...(this.localPlayer ? [this.localPlayer] : []),
+          ...this.bots,
+        ];
+        for (const target of targets) {
+          if (target.id === proj.ownerId || target.userId === proj.ownerId || !target.isAlive) continue;
+          const t = sweepSegmentVsCircle(
+            prevX, prevY, proj.x, proj.y,
+            target.x, target.y, target.radius + proj.radius
+          );
+          if (t !== null) hits.push({ t, type: "player", target });
+        }
       }
 
       if (hits.length === 0) continue; // No collision this frame
 
-      // Sort by t — earliest collision wins
+      // Sort by t — earliest collision along trajectory wins!
       hits.sort((a, b) => a.t - b.t);
       const first = hits[0];
 
@@ -544,9 +773,10 @@ export class GameEngine {
       const impactY = prevY + (proj.y - prevY) * first.t;
 
       if (first.type === "wall") {
+        // Bullet hit wall: spark and destroy projectile. Deal ZERO damage!
         this.particles.sparks(impactX, impactY, proj.color, 5);
         this.projectiles.delete(pid);
-      } else if (first.type === "player" && first.target) {
+      } else if (first.type === "player" && first.target && !this.isMultiplayer) {
         const target = first.target;
         const owner = this.getPlayerById(proj.ownerId);
         if (owner) {
@@ -555,10 +785,6 @@ export class GameEngine {
           this.addDamageNumber(impactX, impactY, dmg, proj.color);
           this.particles.hit(impactX, impactY, proj.color, 10);
           this.screenShake = 0.3;
-
-          if (owner.isLocal && !target.isLocal) {
-            this.recordDamageEvent(target.userId || target.id, dmg);
-          }
 
           if (target.isLocal || owner.isLocal) {
             soundManager.playHit();
@@ -666,11 +892,9 @@ export class GameEngine {
         this.localPlayer.vy += result.dash.dy;
         this.particles.explosion(this.localPlayer.x, this.localPlayer.y, this.localPlayer.accentColor, 12);
         soundManager.playDash();
-        this.pendingLocalAction = { type: "dash", x: this.localPlayer.x, y: this.localPlayer.y, timestamp: Date.now() };
       }
       if (result?.shield) {
         soundManager.playShield();
-        this.pendingLocalAction = { type: "shield", x: this.localPlayer.x, y: this.localPlayer.y, timestamp: Date.now() };
       }
     }
 
@@ -690,7 +914,6 @@ export class GameEngine {
         this.screenShake = 0.45;
         this.particles.explosion(result.aoe.x, result.aoe.y, this.localPlayer.accentColor, 18);
         soundManager.playDash();
-        this.pendingLocalAction = { type: "aoe", x: result.aoe.x, y: result.aoe.y, radius: result.aoe.radius, timestamp: Date.now() };
       }
     }
 
@@ -708,7 +931,6 @@ export class GameEngine {
         this.screenShake = 0.85;
         this.particles.explosion(result.aoe.x, result.aoe.y, this.localPlayer.accentColor, 32);
         soundManager.playUltimate();
-        this.pendingLocalAction = { type: "ultimate", x: result.aoe.x, y: result.aoe.y, radius: result.aoe.radius, timestamp: Date.now() };
       }
     }
   }
@@ -771,11 +993,6 @@ export class GameEngine {
     const id = proj.id || `proj-${++this.projectileIdCounter}-${Date.now()}`;
     const fullProj = { ...proj, id };
     this.projectiles.set(id, fullProj);
-
-    // If fired by local player, enqueue for multiplayer sync!
-    if (!isFromRemote && this.localPlayer && proj.ownerId === this.localPlayer.id) {
-      this.pendingProjectilesToSync.push(fullProj);
-    }
     return id;
   }
 
@@ -987,6 +1204,11 @@ export class GameEngine {
     // Countdown overlay
     if (this.phase === "countdown") {
       this.renderCountdown(ctx);
+    }
+
+    // Development Debug Mode Overlay (F3 or ` / ~)
+    if (this.isDebugOverlay) {
+      this.renderDebugOverlay();
     }
   }
 
@@ -1406,6 +1628,121 @@ export class GameEngine {
     ctx.restore();
   }
 
+  private renderDebugOverlay() {
+    const ctx = this.ctx;
+    ctx.save();
+
+    // 1. Draw Obstacle Collision Boxes in World Space
+    ctx.strokeStyle = "rgba(0, 255, 128, 0.85)";
+    ctx.lineWidth = 1.5;
+    for (const wall of this.arena.walls) {
+      const sx = wall.x - this.cameraX;
+      const sy = wall.y - this.cameraY;
+      ctx.strokeRect(sx, sy, wall.width, wall.height);
+      ctx.fillStyle = "rgba(0, 255, 128, 0.08)";
+      ctx.fillRect(sx, sy, wall.width, wall.height);
+    }
+
+    // 2. Draw Hitboxes (Circles) for Players
+    const all = [
+      ...(this.localPlayer ? [this.localPlayer] : []),
+      ...this.bots,
+      ...Array.from(this.remotePlayers.values()),
+    ];
+    for (const p of all) {
+      const sx = p.x - this.cameraX;
+      const sy = p.y - this.cameraY;
+
+      ctx.beginPath();
+      ctx.arc(sx, sy, p.radius, 0, Math.PI * 2);
+      ctx.strokeStyle = p.isLocal ? "#00ffcc" : "#ff3366";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Facing vector
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(
+        sx + Math.cos(p.facing) * (p.radius + 15),
+        sy + Math.sin(p.facing) * (p.radius + 15)
+      );
+      ctx.strokeStyle = "#ffffff";
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      // Coordinate label
+      ctx.fillStyle = "#ffffff";
+      ctx.font = "10px monospace";
+      ctx.fillText(
+        `${Math.round(p.x)},${Math.round(p.y)}`,
+        sx - 20,
+        sy - p.radius - 5
+      );
+    }
+
+    // 3. Draw Projectile Trajectories
+    ctx.strokeStyle = "rgba(255, 255, 0, 0.8)";
+    ctx.lineWidth = 1.5;
+    for (const proj of this.projectiles.values()) {
+      const sx = proj.x - this.cameraX;
+      const sy = proj.y - this.cameraY;
+
+      ctx.beginPath();
+      ctx.arc(sx, sy, proj.radius, 0, Math.PI * 2);
+      ctx.stroke();
+
+      // Velocity line
+      ctx.beginPath();
+      ctx.moveTo(sx, sy);
+      ctx.lineTo(sx + proj.vx * 0.08, sy + proj.vy * 0.08);
+      ctx.stroke();
+    }
+
+    // 4. HUD Debug Panel (Screen Space)
+    ctx.restore();
+    ctx.save();
+    const panelW = 240;
+    const panelH = 150;
+    const px = this.viewW - panelW - 16;
+    const py = 70;
+
+    ctx.fillStyle = "rgba(8, 10, 16, 0.88)";
+    ctx.strokeStyle = "rgba(0, 245, 255, 0.4)";
+    ctx.lineWidth = 1;
+    ctx.fillRect(px, py, panelW, panelH);
+    ctx.strokeRect(px, py, panelW, panelH);
+
+    ctx.fillStyle = "#00f5ff";
+    ctx.font = "bold 11px monospace";
+    ctx.fillText("ARENAX MULTIPLAYER DEBUG", px + 10, py + 18);
+
+    ctx.fillStyle = "#ffffff";
+    ctx.font = "11px monospace";
+    ctx.fillText(`FPS: ${this.currentFPS}`, px + 10, py + 38);
+    ctx.fillText(`Ping: ${this.currentPing} ms`, px + 10, py + 54);
+    ctx.fillText(`Server Tick: ${this.serverTick}`, px + 10, py + 70);
+    ctx.fillText(`Local Seq: ${this.inputSeq}`, px + 10, py + 86);
+    if (this.localPlayer) {
+      ctx.fillText(
+        `Pos: ${Math.round(this.localPlayer.x)}, ${Math.round(this.localPlayer.y)}`,
+        px + 10,
+        py + 102
+      );
+      ctx.fillText(
+        `HP: ${this.localPlayer.health}/${this.localPlayer.maxHealth}`,
+        px + 10,
+        py + 118
+      );
+    }
+    ctx.fillText(
+      `Remotes: ${this.remotePlayers.size} | Proj: ${this.projectiles.size}`,
+      px + 10,
+      py + 134
+    );
+
+    ctx.restore();
+  }
+
   private renderCountdown(ctx: CanvasRenderingContext2D) {
     const { canvas } = this;
     const countdown = Math.ceil(this.countdownTimer);
@@ -1465,8 +1802,26 @@ export class GameEngine {
   destroy() {
     this.isDestroyed = true;
     cancelAnimationFrame(this.rafHandle);
+
+    if (this.keydownHandler) {
+      window.removeEventListener("keydown", this.keydownHandler);
+    }
+    if (this.mousedownHandler) {
+      this.canvas.removeEventListener("mousedown", this.mousedownHandler);
+    }
+    if (this.mouseupHandler) {
+      this.canvas.removeEventListener("mouseup", this.mouseupHandler);
+    }
+    if (this.contextmenuHandler) {
+      this.canvas.removeEventListener("contextmenu", this.contextmenuHandler);
+    }
+
     this.keyboard.destroy();
     this.particles.clear();
+    this.remotePlayers.clear();
+    this.projectiles.clear();
+    this.pendingInputsToSync = [];
+    this.unacknowledgedInputs = [];
   }
 
   getLocalPlayer() {

@@ -436,58 +436,36 @@ function GamePageContent() {
       });
 
       if (mode === "PRIVATE_ROOM" && roomCode) {
-        // High-frequency multiplayer state sync — pure in-memory, ~50ms round-trip
+        engine.setMultiplayer(true);
+
+        // Authoritative server synchronization (input prediction + server reconciliation)
         let isSyncing = false;
         syncInterval = setInterval(async () => {
           if (isSyncing) return;
           isSyncing = true;
+          const sendTime = performance.now();
           try {
-            const localState = engine.getLocalPlayerState();
-            if (!localState) return;
-
-            const projectiles = engine.getAndClearPendingProjectiles();
+            const inputs = engine.getAndClearPendingInputs();
 
             const res = await fetch(`/api/rooms/${roomCode}/sync`, {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
                 playerId: userId,
-                state: {
-                  ...localState,
-                  userId,
-                  username,
-                  characterSlug: cleanCharacterSlug,
-                },
-                projectiles,
+                userId,
+                username,
+                characterSlug: cleanCharacterSlug,
+                arenaId,
+                inputs,
+                lastKnownTick: engine.getServerTick(),
               }),
             });
 
             if (res.ok) {
-              const data = await res.json();
-
-              // Spawn incoming projectiles fired by other players in real-time!
-              const incomingProj = data.incomingProjectiles || data.data?.incomingProjectiles;
-              if (Array.isArray(incomingProj) && incomingProj.length > 0) {
-                engine.spawnRemoteProjectiles(incomingProj);
-              }
-
-              // Update positions and stats of remote fighters (health synced via state)
-              const playersList = data.players || data.data?.players;
-              if (Array.isArray(playersList)) {
-                for (const p of playersList) {
-                  const pid = p.userId || p.id;
-                  if (!pid || pid === userId) continue;
-                  engine.updateRemotePlayer(pid, p);
-                }
-              }
-
-              // Remove players who have been inactive for 15s (explicit server signal)
-              const disconnected = data.disconnectedPlayers || data.data?.disconnectedPlayers;
-              if (Array.isArray(disconnected)) {
-                for (const pid of disconnected) {
-                  if (pid !== userId) engine.removeRemotePlayer(pid);
-                }
-              }
+              const rtt = Math.round(performance.now() - sendTime);
+              engine.setPing(rtt);
+              const snapshot = await res.json();
+              engine.ingestServerSnapshot(snapshot);
             }
           } catch {
             // Silently handle momentary network drops during real-time sync
@@ -511,6 +489,7 @@ function GamePageContent() {
     return () => {
       if (syncInterval) clearInterval(syncInterval);
       engine?.destroy();
+      engineRef.current = null;
       window.removeEventListener("resize", resize);
     };
   }, [userId, username, cleanCharacterSlug, arenaId, mode, roomCode, handleMatchEnd]);

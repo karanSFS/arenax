@@ -5,6 +5,7 @@
 
 import { ArenaWall } from "@/game/maps/Arena";
 import { CHARACTER_DATA } from "@/game/characters/CharacterConfig";
+import { SnapshotBuffer, RemoteEntitySnapshot } from "@/game/network/SnapshotBuffer";
 
 export interface PlayerData {
   id: string;
@@ -75,6 +76,7 @@ export class Player {
   hitFlash = 0;
   isInvisible = false;
   invisTimer = 0;
+  shield = false;
 
   // Interpolation (for remote players)
   targetX = 0;
@@ -200,17 +202,38 @@ export class Player {
     this.animTimer += dt;
   }
 
-  updateRemote(dt: number) {
-    // 1. Dead reckoning prediction: extrapolate target position based on remote velocity
+  // Snapshot buffer for remote players (smooth interpolation)
+  public snapshotBuffer = new SnapshotBuffer();
+
+  updateRemote(dt: number, renderTime?: number) {
+    // If snapshot buffer has interpolation data, use it for 60 FPS buttery smoothness
+    if (renderTime) {
+      const interpolated = this.snapshotBuffer.getInterpolatedState(renderTime);
+      if (interpolated) {
+        this.x = interpolated.x;
+        this.y = interpolated.y;
+        this.vx = interpolated.vx;
+        this.vy = interpolated.vy;
+        this.facing = interpolated.facing;
+        this.health = interpolated.health;
+        this.maxHealth = interpolated.maxHealth;
+        this.isAlive = interpolated.isAlive;
+        this.animState = interpolated.animState as any;
+        this.animTimer += dt;
+        return;
+      }
+    }
+
+    // Fallback: dead reckoning prediction (extrapolate target position based on velocity)
     this.targetX += this.vx * dt;
     this.targetY += this.vy * dt;
 
-    // 2. Smooth continuous glide towards predicted target position (exponential decay)
+    // Smooth continuous glide towards predicted target position (exponential decay)
     const smoothFactor = Math.min(1, dt * 16);
     this.x += (this.targetX - this.x) * smoothFactor;
     this.y += (this.targetY - this.y) * smoothFactor;
 
-    // 3. Update animation state & walking cycle for remote fighter
+    // Update animation state & walking cycle for remote fighter
     const speed = Math.hypot(this.vx, this.vy);
     if (this.hitFlash > 0.5) {
       this.animState = "hit";
@@ -220,24 +243,6 @@ export class Player {
       this.animState = "idle";
     }
     this.animTimer += dt;
-
-    this.primaryCooldown = Math.max(0, this.primaryCooldown - dt);
-    this.secondaryCooldown = Math.max(0, this.secondaryCooldown - dt);
-    this.tacticalCooldown = Math.max(0, this.tacticalCooldown - dt);
-    this.ultimateCooldown = Math.max(0, this.ultimateCooldown - dt);
-
-    // Remote out-of-combat health regeneration
-    if (this.isAlive && this.health < this.maxHealth) {
-      this.timeSinceLastDamage += dt;
-      if (this.timeSinceLastDamage >= 3.5) {
-        this.regenTimer += dt;
-        if (this.regenTimer >= 1.0) {
-          this.regenTimer = 0;
-          const heal = Math.max(1, Math.round(this.maxHealth * 0.10));
-          this.health = Math.min(this.maxHealth, this.health + heal);
-        }
-      }
-    }
   }
 
   setRemoteState(data: {
@@ -322,16 +327,26 @@ export class Player {
     // 1. If mouse is actively aiming, aim precision 360° toward mouse cursor.
     // 2. If user is moving via Arrow keys or WASD, automatically face in movement direction!
     // 3. Otherwise retain last facing direction.
-    const screenX = this.x - camX;
-    const screenY = this.y - camY;
+    const worldAimX =
+      typeof (input as any).worldAimX === "number"
+        ? (input as any).worldAimX
+        : input.aimX + camX;
+    const worldAimY =
+      typeof (input as any).worldAimY === "number"
+        ? (input as any).worldAimY
+        : input.aimY + camY;
 
-    if (input.isMouseAiming && (input.aimX !== 0 || input.aimY !== 0)) {
-      this.facing = Math.atan2(input.aimY - screenY, input.aimX - screenX);
+    if (input.isMouseAiming && (worldAimX !== 0 || worldAimY !== 0)) {
+      this.facing = Math.atan2(worldAimY - this.y, worldAimX - this.x);
     } else if (isMoving) {
       this.facing = Math.atan2(dy, dx);
     } else if (Math.hypot(this.vx, this.vy) > 15) {
       this.facing = Math.atan2(this.vy, this.vx);
     }
+  }
+
+  pushRemoteSnapshot(snapshot: RemoteEntitySnapshot) {
+    this.snapshotBuffer.push(snapshot);
   }
 
   takeDamage(amount: number, attackerDefense = 0): number {
