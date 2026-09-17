@@ -436,7 +436,7 @@ function GamePageContent() {
       });
 
       if (mode === "PRIVATE_ROOM" && roomCode) {
-        // High-frequency multiplayer state sync for up to 20 players (55ms interval)
+        // High-frequency multiplayer state sync — pure in-memory, ~50ms round-trip
         let isSyncing = false;
         syncInterval = setInterval(async () => {
           if (isSyncing) return;
@@ -445,7 +445,6 @@ function GamePageContent() {
             const localState = engine.getLocalPlayerState();
             if (!localState) return;
 
-            const damageEvents = engine.getAndClearPendingDamageEvents();
             const projectiles = engine.getAndClearPendingProjectiles();
 
             const res = await fetch(`/api/rooms/${roomCode}/sync`, {
@@ -459,7 +458,6 @@ function GamePageContent() {
                   username,
                   characterSlug: cleanCharacterSlug,
                 },
-                damageEvents,
                 projectiles,
               }),
             });
@@ -473,17 +471,7 @@ function GamePageContent() {
                 engine.spawnRemoteProjectiles(incomingProj);
               }
 
-              // Apply authoritative incoming damage inflicted by other players
-              const incoming = data.incomingDamage || data.data?.incomingDamage;
-              if (Array.isArray(incoming)) {
-                for (const inc of incoming) {
-                  if (typeof inc.damage === "number") {
-                    engine.applyIncomingDamage(inc.damage);
-                  }
-                }
-              }
-
-              // Update positions and states of remote fighters
+              // Update positions and stats of remote fighters (health synced via state)
               const playersList = data.players || data.data?.players;
               if (Array.isArray(playersList)) {
                 for (const p of playersList) {
@@ -492,13 +480,22 @@ function GamePageContent() {
                   engine.updateRemotePlayer(pid, p);
                 }
               }
+
+              // Remove players who have been inactive for 15s (explicit server signal)
+              const disconnected = data.disconnectedPlayers || data.data?.disconnectedPlayers;
+              if (Array.isArray(disconnected)) {
+                for (const pid of disconnected) {
+                  if (pid !== userId) engine.removeRemotePlayer(pid);
+                }
+              }
             }
           } catch {
             // Silently handle momentary network drops during real-time sync
           } finally {
             isSyncing = false;
           }
-        }, 80);
+        }, 50);
+
       } else {
         // Add AI bot for practice/quick match only
         import("@/game/ai/BotAI").then(() => {

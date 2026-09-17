@@ -10,6 +10,81 @@ import { KeyboardController, TouchController, InputState } from "@/game/input/In
 import { ARENAS, ArenaConfig } from "@/game/maps/Arena";
 import { soundManager } from "@/game/audio/SoundManager";
 
+// ─── Swept Collision Utilities ────────────────────────────────────────────────
+// Returns parametric t ∈ [0, 1] of the first intersection, or null.
+// t=0 = start of segment, t=1 = end. First-hit-wins: compare t values.
+
+/**
+ * Swept segment vs axis-aligned bounding box (expanded by radius r).
+ * Finds the first t along (ax,ay)→(bx,by) where a circle of radius r enters the AABB.
+ */
+function sweepSegmentVsAABB(
+  ax: number, ay: number, bx: number, by: number, r: number,
+  wx: number, wy: number, ww: number, wh: number
+): number | null {
+  // Expand AABB by r on all sides (Minkowski sum for circle vs AABB)
+  const minX = wx - r, maxX = wx + ww + r;
+  const minY = wy - r, maxY = wy + wh + r;
+
+  const dx = bx - ax, dy = by - ay;
+  let tMin = 0, tMax = 1;
+
+  // Check X slab
+  if (Math.abs(dx) < 1e-9) {
+    if (ax < minX || ax > maxX) return null;
+  } else {
+    const t1 = (minX - ax) / dx;
+    const t2 = (maxX - ax) / dx;
+    tMin = Math.max(tMin, Math.min(t1, t2));
+    tMax = Math.min(tMax, Math.max(t1, t2));
+    if (tMin > tMax) return null;
+  }
+
+  // Check Y slab
+  if (Math.abs(dy) < 1e-9) {
+    if (ay < minY || ay > maxY) return null;
+  } else {
+    const t1 = (minY - ay) / dy;
+    const t2 = (maxY - ay) / dy;
+    tMin = Math.max(tMin, Math.min(t1, t2));
+    tMax = Math.min(tMax, Math.max(t1, t2));
+    if (tMin > tMax) return null;
+  }
+
+  return tMin >= 0 && tMin <= 1 ? tMin : null;
+}
+
+/**
+ * Swept segment vs circle. Returns first t where the point on the segment
+ * is within combinedRadius of the circle center.
+ */
+function sweepSegmentVsCircle(
+  ax: number, ay: number, bx: number, by: number,
+  cx: number, cy: number, combinedRadius: number
+): number | null {
+  const dx = bx - ax, dy = by - ay;
+  const fx = ax - cx, fy = ay - cy;
+  const r = combinedRadius;
+
+  const a = dx * dx + dy * dy;
+  const b = 2 * (fx * dx + fy * dy);
+  const c = fx * fx + fy * fy - r * r;
+
+  // Already overlapping at start: report t=0
+  if (c < 0) return 0;
+  if (a < 1e-9) return null; // Zero-length segment
+
+  const disc = b * b - 4 * a * c;
+  if (disc < 0) return null;
+
+  const sqrtDisc = Math.sqrt(disc);
+  const t = (-b - sqrtDisc) / (2 * a);
+
+  return t >= 0 && t <= 1 ? t : null;
+}
+
+
+
 export type GamePhase = "countdown" | "playing" | "finished";
 
 export interface DamageNumber {
@@ -193,7 +268,16 @@ export class GameEngine {
       }
       return;
     }
-    player.setRemoteState(data);
+    // Clamp incoming coords to arena bounds (prevents OOB desync on stale packets)
+    const clampedData = { ...data };
+    if (typeof clampedData.x === "number") {
+      clampedData.x = Math.max(24, Math.min(this.arena.width - 24, clampedData.x));
+    }
+    if (typeof clampedData.y === "number") {
+      clampedData.y = Math.max(24, Math.min(this.arena.height - 24, clampedData.y));
+    }
+    player.setRemoteState(clampedData);
+
 
     // Trigger visual effects and audio if the remote player performed an ability
     if (data.action && data.action.timestamp) {
@@ -401,8 +485,12 @@ export class GameEngine {
       rp.updateRemote(dt);
     }
 
-    // ── Projectiles ───────────────────────────────────────────
+    // ── Projectiles (Swept-Circle Collision — prevents tunneling) ────────────
     for (const [pid, proj] of this.projectiles) {
+      // Save previous position before integration
+      const prevX = proj.x;
+      const prevY = proj.y;
+
       proj.x += proj.vx * dt;
       proj.y += proj.vy * dt;
       proj.life -= dt;
@@ -413,58 +501,74 @@ export class GameEngine {
         continue;
       }
 
-      // Wall collision
-      let wallHit = false;
+      // ── First-collision-wins: collect all potential hits with parametric t ──
+      // t=0 means start of segment (prevX,prevY), t=1 means end (proj.x,proj.y)
+      type HitCandidate = { t: number; type: "wall" | "player"; target?: Player };
+      const hits: HitCandidate[] = [];
+
+      // Wall swept collision (segment vs expanded AABB)
       for (const wall of this.arena.walls) {
-        if (
-          proj.x + proj.radius > wall.x &&
-          proj.x - proj.radius < wall.x + wall.width &&
-          proj.y + proj.radius > wall.y &&
-          proj.y - proj.radius < wall.y + wall.height
-        ) {
-          wallHit = true;
-          break;
-        }
-      }
-      if (wallHit) {
-        this.particles.sparks(proj.x, proj.y, proj.color, 5);
-        this.projectiles.delete(pid);
-        continue;
+        const t = sweepSegmentVsAABB(
+          prevX, prevY, proj.x, proj.y, proj.radius,
+          wall.x, wall.y, wall.width, wall.height
+        );
+        if (t !== null) hits.push({ t, type: "wall" });
       }
 
-      // Player collision (Include local, bots, AND remote players)
+      // Player swept collision (segment vs circle)
       const targets = [
         ...(this.localPlayer ? [this.localPlayer] : []),
         ...this.bots,
         ...Array.from(this.remotePlayers.values()),
       ];
       for (const target of targets) {
-        if (target.id === proj.ownerId || !target.isAlive) continue;
-        const dist = Math.hypot(target.x - proj.x, target.y - proj.y);
-        if (dist < target.radius + proj.radius) {
-          const owner = this.getPlayerById(proj.ownerId);
-          if (owner) {
-            const dmg = target.takeDamage(proj.damage);
-            owner.damageDealt += dmg;
-            this.addDamageNumber(proj.x, proj.y, dmg, proj.color);
-            this.particles.hit(proj.x, proj.y, proj.color, 10);
-            this.screenShake = 0.3;
+        if (target.id === proj.ownerId || target.userId === proj.ownerId || !target.isAlive) continue;
+        // In PRIVATE_ROOM: remote projectiles do NOT directly damage local player
+        // (health authoritative via state sync). Only apply local/bot damage locally.
+        if (target.isLocal && !this.getPlayerById(proj.ownerId)?.isLocal && this.remotePlayers.size > 0) continue;
+        const t = sweepSegmentVsCircle(
+          prevX, prevY, proj.x, proj.y,
+          target.x, target.y, target.radius + proj.radius
+        );
+        if (t !== null) hits.push({ t, type: "player", target });
+      }
 
-            if (owner.isLocal && !target.isLocal) {
-              this.recordDamageEvent(target.userId || target.id, dmg);
-            }
+      if (hits.length === 0) continue; // No collision this frame
 
-            if (target.isLocal || owner.isLocal) {
-              soundManager.playHit();
-            }
+      // Sort by t — earliest collision wins
+      hits.sort((a, b) => a.t - b.t);
+      const first = hits[0];
 
-            if (!target.isAlive) {
-              this.handleKill(owner, target);
-            }
+      // Impact position along the trajectory
+      const impactX = prevX + (proj.x - prevX) * first.t;
+      const impactY = prevY + (proj.y - prevY) * first.t;
+
+      if (first.type === "wall") {
+        this.particles.sparks(impactX, impactY, proj.color, 5);
+        this.projectiles.delete(pid);
+      } else if (first.type === "player" && first.target) {
+        const target = first.target;
+        const owner = this.getPlayerById(proj.ownerId);
+        if (owner) {
+          const dmg = target.takeDamage(proj.damage);
+          owner.damageDealt += dmg;
+          this.addDamageNumber(impactX, impactY, dmg, proj.color);
+          this.particles.hit(impactX, impactY, proj.color, 10);
+          this.screenShake = 0.3;
+
+          if (owner.isLocal && !target.isLocal) {
+            this.recordDamageEvent(target.userId || target.id, dmg);
           }
-          this.projectiles.delete(pid);
-          break;
+
+          if (target.isLocal || owner.isLocal) {
+            soundManager.playHit();
+          }
+
+          if (!target.isAlive) {
+            this.handleKill(owner, target);
+          }
         }
+        this.projectiles.delete(pid);
       }
     }
 
@@ -909,10 +1013,11 @@ export class GameEngine {
     }
     ctx.stroke();
 
-    // Border glow without expensive software convolution
-    ctx.strokeStyle = this.arena.accentColor;
-    ctx.lineWidth = 3;
-    ctx.strokeRect(2, 2, this.arena.width - 4, this.arena.height - 4);
+    // Refined arena border — semi-transparent, clean
+    ctx.strokeStyle = this.arena.accentColor + "60";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(1, 1, this.arena.width - 2, this.arena.height - 2);
+
     ctx.restore();
   }
 
@@ -922,7 +1027,6 @@ export class GameEngine {
     const viewBottom = camY + this.canvas.height;
 
     for (const wall of this.arena.walls) {
-      // Skip walls outside camera viewport
       if (
         wall.x + wall.width < camX ||
         wall.x > viewRight ||
@@ -932,19 +1036,19 @@ export class GameEngine {
         continue;
       }
 
-      // Fill
-      ctx.fillStyle = "rgba(10, 10, 30, 0.95)";
+      // Premium dark fill — Graphite/Obsidian
+      ctx.fillStyle = "#141820";
       ctx.fillRect(wall.x, wall.y, wall.width, wall.height);
 
-      // Crisp neon border (instant GPU draw)
-      ctx.strokeStyle = this.arena.accentColor;
-      ctx.lineWidth = 2;
-      ctx.strokeRect(wall.x, wall.y, wall.width, wall.height);
+      // Subtle top-lit surface bevel
+      ctx.fillStyle = "rgba(255,255,255,0.05)";
+      ctx.fillRect(wall.x, wall.y, wall.width, 2);
+      ctx.fillRect(wall.x, wall.y, 2, wall.height);
 
-      // Inner highlight
-      ctx.strokeStyle = `${this.arena.accentColor}33`;
-      ctx.lineWidth = 1;
-      ctx.strokeRect(wall.x + 3, wall.y + 3, wall.width - 6, wall.height - 6);
+      // Refined accent border
+      ctx.strokeStyle = this.arena.accentColor + "99";
+      ctx.lineWidth = 1.5;
+      ctx.strokeRect(wall.x + 0.5, wall.y + 0.5, wall.width - 1, wall.height - 1);
     }
     ctx.restore();
   }
@@ -967,22 +1071,31 @@ export class GameEngine {
     ctx.fill();
     ctx.restore();
 
-    // 2. Tactical Player Indicator (Local Player Highlight)
+    // 2. Tactical Player Indicator
     if (player.isLocal) {
-      const rot = now * 0.0025;
+      // Rotating selection arc — electric blue
+      const rot = now * 0.002;
       ctx.save();
-      ctx.strokeStyle = "rgba(0, 245, 255, 0.7)";
+      ctx.strokeStyle = "rgba(76, 141, 255, 0.8)";
       ctx.lineWidth = 1.5;
       ctx.beginPath();
-      ctx.arc(x, y, radius + 8, rot, rot + Math.PI * 1.4);
+      ctx.arc(x, y, radius + 7, rot, rot + Math.PI * 1.3);
       ctx.stroke();
-
-      // Front directional indicator pip
-      const tipDist = radius + 12;
-      ctx.fillStyle = "#00f5ff";
+      // Aim pip
+      const tipDist = radius + 11;
+      ctx.fillStyle = "#4C8DFF";
       ctx.beginPath();
       ctx.arc(x + Math.cos(facing) * tipDist, y + Math.sin(facing) * tipDist, 3, 0, Math.PI * 2);
       ctx.fill();
+      ctx.restore();
+    } else {
+      // Enemy / ally indicator ring — steel gray
+      ctx.save();
+      ctx.strokeStyle = "rgba(141, 153, 168, 0.35)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(x, y, radius + 3, 0, Math.PI * 2);
+      ctx.stroke();
       ctx.restore();
     }
 
@@ -1103,13 +1216,13 @@ export class GameEngine {
     if (characterSlug === "volt") {
       // Long Cyber Railgun with Energy Capacitors
       ctx.fillStyle = "#090d16";
-      ctx.strokeStyle = "#00f5ff";
+      ctx.strokeStyle = "#4C8DFF";
       ctx.lineWidth = 1.5;
       ctx.fillRect(8, 5, 26, 4);
       ctx.strokeRect(8, 5, 26, 4);
 
       // Energy capacitor rings
-      ctx.fillStyle = "#00f5ff";
+      ctx.fillStyle = "#4C8DFF";
       ctx.fillRect(16, 4, 3, 6);
       ctx.fillRect(24, 4, 3, 6);
 
@@ -1269,23 +1382,26 @@ export class GameEngine {
     ctx.lineWidth = 1;
     ctx.strokeRect(barX - 1, barY - 1, barW + 2, barH + 2);
 
-    // Health bar fill
-    const hpColor = player.healthPercent > 0.5 ? "#39ff14" : player.healthPercent > 0.25 ? "#ffd700" : "#ff2d78";
+    // Health bar fill — premium palette
+    const hpColor = player.healthPercent > 0.55
+      ? "#36B37E"  // emerald — healthy
+      : player.healthPercent > 0.28
+      ? "#F0B429"  // amber — caution
+      : "#E05A5A"; // refined red — critical
     ctx.fillStyle = hpColor;
     ctx.fillRect(barX, barY, Math.max(0, barW * player.healthPercent), barH);
 
-    // Player Name & Role Badge
+    // Player Name Tag
     ctx.save();
-    ctx.font = "bold 10px 'Orbitron', monospace";
+    ctx.font = "bold 9px 'Orbitron', monospace";
     ctx.textAlign = "center";
 
     if (player.isLocal) {
-      ctx.fillStyle = "#00f5ff";
-      ctx.fillText(`[YOU] ${player.username}`, x, barY - 5);
+      ctx.fillStyle = "#4C8DFF"; // electric blue
+      ctx.fillText(`▶ ${player.username}`, x, barY - 5);
     } else {
-      ctx.fillStyle = "#e2e8f0";
-      const roleTag = characterSlug ? `[${characterSlug.toUpperCase()}] ` : "";
-      ctx.fillText(`${roleTag}${player.username}`, x, barY - 5);
+      ctx.fillStyle = "#A7ADB5"; // steel gray
+      ctx.fillText(player.username, x, barY - 5);
     }
     ctx.restore();
   }
@@ -1305,7 +1421,7 @@ export class GameEngine {
       ctx.translate(canvas.width / 2, canvas.height / 2);
       ctx.scale(scale, scale);
 
-      ctx.fillStyle = "#00f5ff";
+      ctx.fillStyle = "#4C8DFF";
       ctx.font = `bold ${150}px 'Orbitron', monospace`;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
@@ -1313,7 +1429,7 @@ export class GameEngine {
       ctx.fillText(countdown.toString(), 0, 0);
       ctx.restore();
     } else {
-      ctx.fillStyle = "#ff2d78";
+      ctx.fillStyle = "#E05A5A";
       ctx.font = `bold 100px 'Orbitron', monospace`;
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";

@@ -1,11 +1,14 @@
 import { NextRequest, NextResponse } from "next/server";
-import { auth } from "@/lib/auth";
-import { connectDB } from "@/lib/mongodb";
-import mongoose from "mongoose";
 
 export const dynamic = "force-dynamic";
 
-export interface PlayerSyncPayload {
+// ─── In-Memory Game State Store ──────────────────────────────────────────────
+// NO MongoDB in the game loop. MongoDB is only for match result persistence.
+// All real-time game state lives in this process-global in-memory store.
+// Sub-millisecond response times vs 300-800ms MongoDB round trips.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface PlayerSyncState {
   userId: string;
   username: string;
   characterSlug: string;
@@ -20,98 +23,95 @@ export interface PlayerSyncPayload {
   kills: number;
   deaths: number;
   isAlive: boolean;
-  action?: {
-    type: "primary" | "secondary" | "ultimate" | "hit";
-    data?: any;
-  };
-  signal?: any;
+  action?: { type: string; x?: number; y?: number; timestamp?: number };
   updatedAt: number;
 }
 
-// In-memory local cache across requests in the same lambda
+interface StoredProjectile {
+  id: string;
+  senderId: string;
+  projectile: any;
+  createdAt: number;
+}
+
 declare global {
   // eslint-disable-next-line no-var
-  var _arenaxRoomSync: Map<string, Map<string, PlayerSyncPayload>> | undefined;
+  var _arenaxMemPlayers: Map<string, Map<string, PlayerSyncState>> | undefined;
   // eslint-disable-next-line no-var
-  var _arenaxRoomProjectiles: Map<string, Array<{ id: string; senderId: string; projectile: any; createdAt: number }>> | undefined;
+  var _arenaxMemProjectiles: Map<string, StoredProjectile[]> | undefined;
 }
 
-if (!global._arenaxRoomSync) {
-  global._arenaxRoomSync = new Map();
+if (!global._arenaxMemPlayers) {
+  global._arenaxMemPlayers = new Map();
 }
-if (!global._arenaxRoomProjectiles) {
-  global._arenaxRoomProjectiles = new Map();
+if (!global._arenaxMemProjectiles) {
+  global._arenaxMemProjectiles = new Map();
 }
 
+// TTL constants
+const PLAYER_STALE_MS = 15_000; // Remove player after 15s of inactivity
+const PROJ_STALE_MS   =  2_000; // Remove projectiles after 2s
+const MAX_PROJ_QUEUE  =    200; // Max projectiles per room to prevent memory growth
+
+function getRoomPlayers(roomCode: string): Map<string, PlayerSyncState> {
+  const store = global._arenaxMemPlayers!;
+  if (!store.has(roomCode)) store.set(roomCode, new Map());
+  return store.get(roomCode)!;
+}
+
+function getRoomProjectiles(roomCode: string): StoredProjectile[] {
+  const store = global._arenaxMemProjectiles!;
+  if (!store.has(roomCode)) store.set(roomCode, []);
+  return store.get(roomCode)!;
+}
+
+// ─── POST /api/rooms/[roomCode]/sync ─────────────────────────────────────────
 export async function POST(
   req: NextRequest,
   { params }: { params: { roomCode: string } }
 ) {
   try {
-    const session = await auth();
     const roomCode = params.roomCode.toUpperCase();
     const body = await req.json();
 
-    // Support both direct payload or wrapped in .state
     const pData = body.state || body;
     const callerId =
       body.playerId ||
       pData.userId ||
-      (session?.user as { id?: string })?.id ||
-      req.headers.get("x-player-id") ||
-      "anon-" + req.ip;
-
-    const callerName =
-      pData.username ||
-      (session?.user as { username?: string })?.username ||
-      session?.user?.name ||
-      "Player";
-
-    const callerChar = pData.characterSlug || "blaze";
+      "anon-" + Math.random().toString(36).slice(2, 8);
 
     const now = Date.now();
-    let incomingDamage: Array<{ damage: number; attackerId?: string }> = [];
 
-    const playerPayload: PlayerSyncPayload = {
-      userId: callerId,
-      username: callerName,
-      characterSlug: callerChar,
-      x: typeof pData.x === "number" ? pData.x : 1200,
-      y: typeof pData.y === "number" ? pData.y : 700,
-      vx: typeof pData.vx === "number" ? pData.vx : 0,
-      vy: typeof pData.vy === "number" ? pData.vy : 0,
-      facing: typeof pData.facing === "number" ? pData.facing : 0,
-      health: typeof pData.health === "number" ? pData.health : 100,
-      maxHealth: typeof pData.maxHealth === "number" ? pData.maxHealth : 100,
-      score: typeof pData.score === "number" ? pData.score : 0,
-      kills: typeof pData.kills === "number" ? pData.kills : 0,
-      deaths: typeof pData.deaths === "number" ? pData.deaths : 0,
-      isAlive: typeof pData.isAlive === "boolean" ? pData.isAlive : true,
-      action: pData.action || body.action,
-      signal: pData.signal || body.signal,
-      updatedAt: now,
+    // ── 1. Upsert caller state into in-memory room map ───────────────────────
+    const roomPlayers = getRoomPlayers(roomCode);
+    const playerState: PlayerSyncState = {
+      userId:        callerId,
+      username:      pData.username || "Player",
+      characterSlug: pData.characterSlug || "blaze",
+      x:             typeof pData.x        === "number"  ? pData.x        : 1200,
+      y:             typeof pData.y        === "number"  ? pData.y        : 700,
+      vx:            typeof pData.vx       === "number"  ? pData.vx       : 0,
+      vy:            typeof pData.vy       === "number"  ? pData.vy       : 0,
+      facing:        typeof pData.facing   === "number"  ? pData.facing   : 0,
+      health:        typeof pData.health   === "number"  ? pData.health   : 100,
+      maxHealth:     typeof pData.maxHealth === "number" ? pData.maxHealth : 100,
+      score:         typeof pData.score    === "number"  ? pData.score    : 0,
+      kills:         typeof pData.kills    === "number"  ? pData.kills    : 0,
+      deaths:        typeof pData.deaths   === "number"  ? pData.deaths   : 0,
+      isAlive:       typeof pData.isAlive  === "boolean" ? pData.isAlive  : true,
+      action:        pData.action || body.action,
+      updatedAt:     now,
     };
+    roomPlayers.set(callerId, playerState);
 
-    // 1. Update in-memory local layer
-    const memRooms = global._arenaxRoomSync!;
-    if (!memRooms.has(roomCode)) {
-      memRooms.set(roomCode, new Map());
-    }
-    const memRoom = memRooms.get(roomCode)!;
-    memRoom.set(callerId, playerPayload);
-
-    // 1b. Update in-memory projectiles
-    const newProjectiles = Array.isArray(body.projectiles) ? body.projectiles : [];
-    const memProjs = global._arenaxRoomProjectiles!;
-    if (!memProjs.has(roomCode)) {
-      memProjs.set(roomCode, []);
-    }
-    const roomProjList = memProjs.get(roomCode)!;
+    // ── 2. Add incoming projectiles from this caller ─────────────────────────
+    const newProjectiles: any[] = Array.isArray(body.projectiles) ? body.projectiles : [];
+    const roomProjs = getRoomProjectiles(roomCode);
 
     for (const p of newProjectiles) {
       if (p && typeof p.x === "number" && typeof p.vx === "number") {
-        roomProjList.push({
-          id: p.id || `p_${callerId}_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        roomProjs.push({
+          id: p.id || `p_${callerId}_${now}_${Math.random().toString(36).slice(2, 6)}`,
           senderId: callerId,
           projectile: p,
           createdAt: now,
@@ -119,12 +119,34 @@ export async function POST(
       }
     }
 
-    // Keep only fresh projectiles from last 2000ms
-    const freshProjs = roomProjList.filter((p) => now - p.createdAt < 2000);
-    memProjs.set(roomCode, freshProjs);
+    // ── 3. Evict stale projectiles and trim queue ────────────────────────────
+    const freshProjs = roomProjs.filter((p) => now - p.createdAt < PROJ_STALE_MS);
+    const trimmedProjs = freshProjs.length > MAX_PROJ_QUEUE
+      ? freshProjs.slice(freshProjs.length - MAX_PROJ_QUEUE)
+      : freshProjs;
+    global._arenaxMemProjectiles!.set(roomCode, trimmedProjs);
 
-    // Incoming projectiles for this caller (from other players)
-    const incomingProjectiles: any[] = freshProjs
+    // ── 4. Evict stale players — track who timed out ─────────────────────────
+    // Players are ONLY removed after 15s without a heartbeat.
+    // Clients must receive this list and explicitly remove those entities.
+    const disconnectedPlayers: string[] = [];
+    for (const [pid, p] of roomPlayers.entries()) {
+      if (now - p.updatedAt > PLAYER_STALE_MS) {
+        disconnectedPlayers.push(pid);
+        roomPlayers.delete(pid);
+      }
+    }
+
+    // ── 5. Build response: other players + their queued projectiles ──────────
+    const otherPlayers: PlayerSyncState[] = [];
+    for (const [pid, p] of roomPlayers.entries()) {
+      if (pid !== callerId) {
+        otherPlayers.push(p);
+      }
+    }
+
+    // Projectiles fired by other players (the client deduplicates by ID)
+    const incomingProjectiles = trimmedProjs
       .filter((p) => p.senderId !== callerId)
       .map((p) => ({
         ...p.projectile,
@@ -132,158 +154,24 @@ export async function POST(
         ownerId: p.senderId,
       }));
 
-    // 2. Persist to MongoDB room_states so all Vercel serverless lambdas share real-time state
-    try {
-      await connectDB();
-      const db = mongoose.connection.db;
-      if (db) {
-        const col = db.collection("room_states");
-        await col.updateOne(
-          { _id: `${roomCode}:${callerId}` as any },
-          {
-            $set: {
-              ...playerPayload,
-              roomCode,
-              updatedAtDate: new Date(),
-            },
-          },
-          { upsert: true }
-        );
-
-        // 2b. Process damage events sent by attacker
-        const damageEvents = Array.isArray(body.damageEvents) ? body.damageEvents : [];
-        if (damageEvents.length > 0) {
-          const dmgCol = db.collection("room_damage");
-          for (const de of damageEvents) {
-            if (de.targetId && typeof de.damage === "number") {
-              await dmgCol.insertOne({
-                roomCode,
-                targetId: de.targetId,
-                attackerId: callerId,
-                damage: de.damage,
-                createdAt: new Date(),
-              });
-            }
-          }
-        }
-
-        // 2c. Fetch any damage inflicted upon this caller
-        const dmgCol = db.collection("room_damage");
-        const incomingDocs = await dmgCol
-          .find({ roomCode, targetId: callerId })
-          .toArray();
-
-        if (incomingDocs.length > 0) {
-          const idsToDelete = incomingDocs.map((d) => d._id);
-          await dmgCol.deleteMany({ _id: { $in: idsToDelete } });
-          incomingDamage = incomingDocs.map((d) => ({
-            damage: d.damage,
-            attackerId: d.attackerId,
-          }));
-        }
-
-        // 2d. Persist new projectiles to MongoDB
-        if (newProjectiles.length > 0) {
-          const pCol = db.collection("room_projectiles");
-          const docs = newProjectiles.map((p: any) => ({
-            roomCode,
-            senderId: callerId,
-            projectile: p,
-            createdAt: new Date(),
-          }));
-          await pCol.insertMany(docs);
-        }
-
-        // 2e. Query recent projectiles from DB
-        const pCol = db.collection("room_projectiles");
-        const recentPDocs = await pCol
-          .find({
-            roomCode,
-            senderId: { $ne: callerId },
-            createdAt: { $gt: new Date(now - 2000) },
-          })
-          .toArray();
-
-        for (const doc of recentPDocs) {
-          if (doc.projectile) {
-            const pId = doc.projectile.id || String(doc._id);
-            if (!incomingProjectiles.some((ip) => ip.id === pId)) {
-              incomingProjectiles.push({
-                ...doc.projectile,
-                id: pId,
-                ownerId: doc.senderId,
-              });
-            }
-          }
-        }
-
-        // Fetch all active players in this room updated within last 5 seconds
-        const activeSince = new Date(Date.now() - 5000);
-        const dbDocs = await col
-          .find({ roomCode, updatedAtDate: { $gt: activeSince } })
-          .toArray();
-
-        // Merge DB players into memory layer
-        for (const doc of dbDocs) {
-          if (doc.userId) {
-            memRoom.set(doc.userId, {
-              userId: doc.userId,
-              username: doc.username,
-              characterSlug: doc.characterSlug,
-              x: doc.x,
-              y: doc.y,
-              vx: doc.vx,
-              vy: doc.vy,
-              facing: doc.facing,
-              health: doc.health,
-              maxHealth: doc.maxHealth,
-              score: doc.score,
-              kills: doc.kills,
-              deaths: doc.deaths,
-              isAlive: doc.isAlive,
-              action: doc.action,
-              signal: doc.signal,
-              updatedAt: doc.updatedAt || Date.now(),
-            });
-          }
-        }
-      }
-    } catch (dbErr) {
-      console.warn("MongoDB room_sync fallback to in-memory:", dbErr);
-    }
-
-    // Clean up stale memory records (> 6 seconds)
-    for (const [pId, p] of memRoom.entries()) {
-      if (now - p.updatedAt > 6000) {
-        memRoom.delete(pId);
-      }
-    }
-
-    // Extract all other players in this room
-    const otherPlayers: PlayerSyncPayload[] = [];
-    for (const [pId, p] of memRoom.entries()) {
-      if (pId !== callerId) {
-        otherPlayers.push(p);
-      }
-    }
-
-    // Provide both top-level `players` and `data.players` for absolute compatibility
     return NextResponse.json({
       success: true,
       players: otherPlayers,
-      incomingDamage,
       incomingProjectiles,
+      disconnectedPlayers,
+      incomingDamage: [], // Damage is now determined by health field in state sync
       data: {
         timestamp: now,
         players: otherPlayers,
-        incomingDamage,
         incomingProjectiles,
+        disconnectedPlayers,
+        incomingDamage: [],
       },
     });
   } catch (err) {
     console.error("Room sync error:", err);
     return NextResponse.json(
-      { success: false, error: { code: "SYNC_ERROR", message: "Failed to sync room state." } },
+      { success: false, error: { code: "SYNC_ERROR", message: "Sync failed." } },
       { status: 500 }
     );
   }
